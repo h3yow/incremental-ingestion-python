@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""FastAPI 应用入口：uvicorn main:app --reload。
 
-app = FastAPI()
+数据目录默认 ./data，可用环境变量 INGESTION_DATA_DIR 覆盖。
+"""
+from ingestion.api import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]

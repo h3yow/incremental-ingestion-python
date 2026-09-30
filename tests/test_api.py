@@ -83,5 +83,91 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn("unknown", rows[0])
 
 
+class BusinessBatchApiTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        pipeline = Pipeline(root)
+        self.source = LocalSource(
+            JsonlStore(f"{root}/source.jsonl", lock=pipeline._store_lock))
+        self.client = TestClient(create_app(pipeline, self.source))
+        self.pipeline = pipeline
+        for table, cols, keys in [
+            ("so", [{"name": "order_id", "typ": "int"},
+                    {"name": "amount", "typ": "int"}], ["order_id"]),
+            ("si", [{"name": "order_id", "typ": "int"},
+                    {"name": "sku", "typ": "str"},
+                    {"name": "qty", "typ": "int"}], ["order_id", "sku"]),
+        ]:
+            r = self.client.post(f"/tables/{table}/init",
+                                 json={"columns": cols, "key_columns": keys})
+            self.assertEqual(r.status_code, 200, r.text)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_cross_table_commit_replay_and_failure_over_http(self):
+        body = {"batch_id": "s1", "schema_version": 1, "ops": [
+            {"table": "so", "op_type": "UPSERT", "key": [1], "revision": 1,
+             "data": {"order_id": 1, "amount": 100}},
+            {"table": "si", "op_type": "UPSERT", "key": [1, "A"], "revision": 1,
+             "data": {"order_id": 1, "sku": "A", "qty": 2}},
+        ]}
+        r1 = self.client.post("/business-batches", json=body)
+        self.assertEqual(r1.status_code, 200, r1.text)
+        self.assertEqual(r1.json()["sequence"], 1)
+        # 重复提交 -> 回放
+        r2 = self.client.post("/business-batches", json=body)
+        self.assertTrue(r2.json()["replay"])
+        self.assertEqual(r2.json()["sequence"], 1)
+
+        # 明细表失败：409，且定位到业务批次/表/键/原因，订单表无数据
+        bad = {"batch_id": "s-bad", "schema_version": 1, "ops": [
+            {"table": "so", "op_type": "UPSERT", "key": [2], "revision": 1,
+             "data": {"order_id": 2, "amount": 50}},
+            {"table": "si", "op_type": "UPSERT", "key": [2, "A"], "revision": 1,
+             "data": {"order_id": 2, "sku": "A", "qty": "X"}},
+        ]}
+        rj = self.client.post("/business-batches", json=bad)
+        self.assertEqual(rj.status_code, 409)
+        detail = rj.json()["detail"]
+        self.assertEqual(detail["reason"], "TYPE_MISMATCH")
+        self.assertEqual(detail["batch_id"], "s-bad")
+        self.assertEqual(detail["table"], "si")
+        self.assertEqual(detail["key"], [2, "A"])
+        self.assertEqual(self.client.get("/business-batches/s-bad").status_code, 404)
+
+    def test_correction_retract_current_and_history_over_http(self):
+        def upsert(bid, rev, amount):
+            return self.client.post("/business-batches", json={
+                "batch_id": bid, "schema_version": 1, "ops": [
+                    {"table": "so", "op_type": "UPSERT", "key": [1],
+                     "revision": rev, "data": {"order_id": 1, "amount": amount}}]})
+
+        upsert("b1", 1, 100)
+        upsert("b2", 2, 120)
+        cur = self.client.get("/tables/so/business/current?key=[1]")
+        self.assertEqual(cur.json()["data"]["amount"], 120)
+
+        # 旧 revision 翻案 -> 409 STALE_REVISION
+        stale = upsert("old", 1, 1)
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["detail"]["reason"], "STALE_REVISION")
+
+        # 撤回
+        r = self.client.post("/business-batches", json={
+            "batch_id": "r1", "schema_version": 1, "ops": [
+                {"table": "so", "op_type": "RETRACT", "key": [1], "revision": 3}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        cur_after = self.client.get("/tables/so/business/current?key=[1]").json()
+        self.assertEqual(cur_after["status"], "RETRACT")
+        self.assertIsNone(cur_after["data"])
+        # 历史轨迹完整可解释
+        hist = self.client.get("/tables/so/business/history?key=[1]").json()
+        self.assertEqual([h["revision"] for h in hist["history"]], [1, 2, 3])
+        self.assertEqual([h["status"] for h in hist["history"]],
+                         ["UPSERT", "UPSERT", "RETRACT"])
+
+
 if __name__ == "__main__":
     unittest.main()

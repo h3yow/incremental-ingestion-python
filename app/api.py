@@ -21,8 +21,9 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from app.models import (Batch, ChangeType, Column, Record, SchemaChange)
-from app.pipeline import BatchRejected, Pipeline
+from app.models import (Batch, BusinessBatch, BusinessOp, ChangeType, Column,
+                        OpType, Record, SchemaChange)
+from app.pipeline import (BatchRejected, BusinessBatchRejected, Pipeline)
 from app.schema_store import SchemaError
 from app.source import LocalSource
 from app.storage import JsonlStore
@@ -37,6 +38,7 @@ class ColumnIn(BaseModel):
 
 class InitIn(BaseModel):
     columns: list[ColumnIn]
+    key_columns: list[str] = []
 
 
 class SchemaChangeIn(BaseModel):
@@ -68,6 +70,21 @@ class RunIn(BaseModel):
     limit: int = 100
 
 
+class BusinessOpIn(BaseModel):
+    table: str
+    op_type: Literal["UPSERT", "RETRACT"]
+    key: list[Any]                    # 业务键取值，顺序对齐建表声明的 key_columns
+    revision: int
+    data: dict[str, Any] | None = None
+    schema_version: int | None = None
+
+
+class BusinessBatchIn(BaseModel):
+    batch_id: str
+    schema_version: int
+    ops: list[BusinessOpIn]
+
+
 def _column(inp: ColumnIn) -> Column:
     return Column(name=inp.name, typ=inp.typ,
                   required=inp.required, default=inp.default)
@@ -85,13 +102,22 @@ def create_app(pipeline: Pipeline | None = None,
         return HTTPException(status_code=409,
                              detail={"reason": exc.reason.value, "message": str(exc)})
 
+    def business_conflict(exc: BusinessBatchRejected) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "reason": exc.reason.value, "message": str(exc),
+            "batch_id": exc.batch_id, "table": exc.table,
+            "key": list(exc.key) if exc.key is not None else None})
+
     @app.post("/tables/{table}/init")
     def init_table(table: str, body: InitIn):
         try:
-            version = pipeline.init_table(table, [_column(c) for c in body.columns])
+            version = pipeline.init_table(
+                table, [_column(c) for c in body.columns],
+                key_columns=tuple(body.key_columns))
         except SchemaError as exc:
             raise HTTPException(status_code=409, detail={"message": str(exc)})
-        return {"table": table, "schema_version": version}
+        return {"table": table, "schema_version": version,
+                "key_columns": body.key_columns}
 
     @app.get("/tables/{table}")
     def snapshot(table: str):
@@ -165,5 +191,71 @@ def create_app(pipeline: Pipeline | None = None,
             raise HTTPException(status_code=404, detail={"message": str(exc)})
         return {"batch_id": result.batch_id, "checkpoint": result.checkpoint,
                 "accepted_count": result.accepted_count, "replay": result.replay}
+
+    # ---------- 跨表业务批次（结算：更正 / 撤回） ----------
+    @app.post("/business-batches")
+    def submit_business_batch(body: BusinessBatchIn):
+        ops = [BusinessOp(
+            table=o.table, op_type=OpType(o.op_type),
+            key=tuple(o.key), revision=o.revision, data=o.data,
+            op_schema_version=o.schema_version)
+            for o in body.ops]
+        batch = BusinessBatch(batch_id=body.batch_id, ops=ops,
+                              schema_version=body.schema_version)
+        try:
+            result = pipeline.submit_business_batch(batch)
+        except BusinessBatchRejected as exc:
+            raise business_conflict(exc)
+        return {
+            "batch_id": result.batch_id, "committed": result.committed,
+            "sequence": result.sequence, "replay": result.replay,
+            "tables": [{"table": t.table, "ops": t.ops,
+                        "schema_version": t.schema_version}
+                       for t in result.tables],
+        }
+
+    @app.get("/business-batches/{batch_id}")
+    def get_business_batch(batch_id: str):
+        trace = pipeline.business_trace(batch_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail={"message": "业务批次不存在"})
+        return trace
+
+    @app.get("/tables/{table}/business/current")
+    def current_state(table: str, key: str):
+        """查询业务键当前最后一次有效结论。key 为 JSON 数组，如 ?key=[1] 或 ?key=[1,"A"]。"""
+        import json as _json
+        try:
+            key_tuple = tuple(_json.loads(key))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422,
+                                detail={"message": "key 必须是 JSON 数组"})
+        conclusion = pipeline.current_conclusion(table, key_tuple)
+        if conclusion is None:
+            raise HTTPException(status_code=404,
+                                detail={"message": "该业务键尚无结论"})
+        return {
+            "table": table, "key": list(conclusion.key),
+            "revision": conclusion.revision,
+            "status": conclusion.status.value,
+            "data": conclusion.data,
+            "schema_version": conclusion.schema_version,
+            "sequence": conclusion.sequence, "batch_id": conclusion.batch_id,
+        }
+
+    @app.get("/tables/{table}/business/history")
+    def business_history(table: str, key: str):
+        """查询业务键经历过的全部更正/撤回轨迹。"""
+        import json as _json
+        try:
+            key_tuple = tuple(_json.loads(key))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422,
+                                detail={"message": "key 必须是 JSON 数组"})
+        history = pipeline.business_history(table, key_tuple)
+        if not history:
+            raise HTTPException(status_code=404,
+                                detail={"message": "该业务键尚无处理轨迹"})
+        return {"table": table, "key": list(key_tuple), "history": history}
 
     return app

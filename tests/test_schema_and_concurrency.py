@@ -101,10 +101,22 @@ class ConcurrencyTest(IngestionCase):
         errors: list[Exception] = []
 
         def ingest(start: int, bid: str):
+            # 并发下另一线程可能先/后提交：在锁约定下从“当时已确认位点”继续；
+            # 若自己的区间尚未就绪（前一区间还没提交），短暂等待后重试，
+            # 这正是断点续传语义，绝不允许跳号写入。
+            import time
             try:
-                recs = self.source.read("orders", start, 100)
-                self.pipeline.submit_batch(
-                    Batch(bid, "orders", recs, 1))
+                for _ in range(100):
+                    cp = self.pipeline.checkpoints.get("orders")
+                    if cp + 1 < start:
+                        time.sleep(0.002)
+                        continue
+                    actual_start = max(start, cp + 1)
+                    recs = self.source.read("orders", actual_start, 100)
+                    if recs:
+                        self.pipeline.submit_batch(
+                            Batch(bid, "orders", recs, 1))
+                    return
             except Exception as exc:  # noqa: BLE001 - 收集线程错误
                 errors.append(exc)
 

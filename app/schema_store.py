@@ -44,6 +44,13 @@ class SchemaStore:
         return any(e["table"] == table and e["change_type"] == _INIT
                    for e in self.changelog.read_all())
 
+    def key_columns(self, table: str) -> tuple[str, ...]:
+        """业务键列（建表时声明，元组顺序即键元组顺序）；未声明返回空元组。"""
+        for e in self.changelog.read_all():
+            if e["table"] == table and e["change_type"] == _INIT:
+                return tuple(e.get("key_columns", ()))
+        raise SchemaError(f"table={table} 尚未初始化")
+
     def changes(self, table: str) -> list[SchemaChange]:
         out = []
         for e in self.changelog.read_all():
@@ -95,7 +102,8 @@ class SchemaStore:
         with self.changelog.lock():
             self.changelog.append(event)
 
-    def init_table(self, table: str, columns: list[Column]) -> int:
+    def init_table(self, table: str, columns: list[Column],
+                   key_columns: tuple[str, ...] | list[str] = ()) -> int:
         with self.changelog.lock():
             if self.is_initialized(table):
                 raise SchemaError(f"table={table} 已初始化，禁止重复建表")
@@ -104,9 +112,16 @@ class SchemaStore:
             names = [c.name for c in columns]
             if len(set(names)) != len(names):
                 raise SchemaError("列名重复")
+            key_columns = tuple(key_columns)
+            missing = [k for k in key_columns if k not in names]
+            if missing:
+                raise SchemaError(f"业务键列不存在: {missing}")
+            if len(set(key_columns)) != len(key_columns):
+                raise SchemaError("业务键列重复")
             self._append({
                 "table": table, "version": 1, "change_type": _INIT,
                 "columns": [_column_to_dict(c) for c in columns],
+                "key_columns": list(key_columns),
             })
             return 1
 
@@ -134,6 +149,9 @@ class SchemaStore:
             version = self._next_version(table)
             if not any(c.name == column_name for c in self.columns(table)):
                 raise SchemaError(f"列 {column_name} 不存在，无法删除")
+            if column_name in self.key_columns(table):
+                raise SchemaError(
+                    f"业务键列 {column_name} 不允许删除：业务身份必须跨更正/撤回保持稳定")
             self._append({
                 "table": table, "version": version,
                 "change_type": ChangeType.DROP_COLUMN.value,
@@ -149,6 +167,9 @@ class SchemaStore:
                 raise SchemaError(f"列 {old} 不存在，无法改名")
             if any(c.name == new for c in current):
                 raise SchemaError(f"列名 {new} 已被占用")
+            if old in self.key_columns(table):
+                raise SchemaError(
+                    f"业务键列 {old} 不允许改名：业务身份必须跨更正/撤回保持稳定")
             self._append({
                 "table": table, "version": version,
                 "change_type": ChangeType.RENAME_COLUMN.value,

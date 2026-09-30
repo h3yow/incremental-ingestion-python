@@ -1,7 +1,7 @@
 """增量接入编排。
 
-提交协议（接入协议的服务端实现）
---------------------------------
+提交协议（单表位点通道的服务端实现）
+------------------------------------
 1. 每张表的所有操作（批次提交 / 结构变更 / 位点推进）在同一把表锁内串行，
    并发提交与结构变更的结论因此确定且可解释。
 2. 幂等：以 batch_id 为幂等键。重复提交同一批次 -> 直接回放首次处理结论
@@ -16,6 +16,22 @@
    结果统一记为 NOT_PROCESSED_AFTER_REJECTION；全部记录结论写入批次留痕。
 6. 位点只推进到已提交前缀末尾；调用方修正坏记录后应从 checkpoint+1 重新提交
    （新批次），从而做到不重复、不丢失。
+
+跨表业务批次协议（结算：整体提交 / 更正 / 撤回）
+------------------------------------------------
+A. 一个 BusinessBatch 可含多张关联表的 BusinessOp（UPSERT=写入/更正，
+   RETRACT=撤回），按业务键（建表声明的 key_columns）寻址，每条操作带上游
+   严格递增的 revision。
+B. 提交时按表名全局排序获取全部相关表锁（与上面的单表通道、DDL 共用同一把锁，
+   避免死锁并保证三类操作可线性化），在锁内完成“全部校验 -> 分配全局顺序号
+   sequence -> 向 business_batches.jsonl 做且只做一次追加（fsync）”。
+   追加成功即所有表同时生效；追加缺失/半行即所有表都不生效，因此不存在
+   半张表数据。失败精确定位到 batch_id / table / key / reason，且不占顺序号。
+C. 当前状态 = 按 sequence 折叠日志，每个业务键只保留 revision 最大的结论；
+   revision 不新于已生效结论 -> STALE_REVISION（旧值不翻案、撤回后不复活）。
+   全部 UPSERT/RETRACT 历史保留，可逐键解释更正轨迹。
+D. 幂等：batch_id 全局唯一，重复提交回放首次结论；进程在追加前/追加中途中断，
+   重放后都收敛到同一最终状态（坏尾行由 SettlementJournal 截断丢弃）。
 """
 
 from __future__ import annotations
@@ -25,9 +41,11 @@ import threading
 from pathlib import Path
 
 from app.checkpoint import CheckpointStore, OffsetError
-from app.models import (Batch, BatchResult, Column, RecordResult, RejectReason,
-                        SchemaChange)
+from app.models import (Batch, BatchResult, BusinessBatch,
+                        BusinessBatchResult, BusinessOp, Column, OpType,
+                        RecordResult, RejectReason, SchemaChange, TableOutcome)
 from app.schema_store import SchemaError, SchemaStore
+from app.settlement import Conclusion, LedgerView, SettlementJournal
 from app.source import LocalSource
 from app.storage import JsonlStore, KVStore
 from app.target import TargetTable
@@ -43,6 +61,22 @@ class BatchRejected(Exception):
 
     def __init__(self, reason: RejectReason, detail: str):
         self.reason = reason
+        super().__init__(f"{reason.value}: {detail}")
+
+
+class BusinessBatchRejected(Exception):
+    """跨表业务批次整体被拒：校验在任何写入前完成，故无任何表生效。
+
+    失败精确定位到业务批次 / 表 / 业务键 / 数据类别。
+    """
+
+    def __init__(self, reason: RejectReason, detail: str, *,
+                 batch_id: str = "", table: str = "",
+                 key: tuple[object, ...] | None = None):
+        self.reason = reason
+        self.batch_id = batch_id
+        self.table = table
+        self.key = key
         super().__init__(f"{reason.value}: {detail}")
 
 
@@ -76,6 +110,10 @@ class Pipeline:
             JsonlStore(self.root / "rows.jsonl", lock=self._store_lock))
         self._batch_store = JsonlStore(self.root / "batches.jsonl",
                                        lock=self._store_lock)
+        # 跨表业务批次的提交日志：单条追加即整个业务批次的原子提交点
+        self.ledger = SettlementJournal(self.root / "business_batches.jsonl")
+        # 测试钩子：在 journal 追加前抛异常，模拟“执行到一半中断”
+        self._crash_before_business_commit = False
 
     def _table_lock(self, table: str) -> threading.RLock:
         with self._locks_guard:
@@ -87,12 +125,14 @@ class Pipeline:
 
 
     # ---------------- 建表 / 结构变更 ----------------
-    def init_table(self, table: str, columns: list[Column]) -> int:
+    def init_table(self, table: str, columns: list[Column],
+                   key_columns: tuple[str, ...] | list[str] = ()) -> int:
         lock = self._table_lock(table)
         with lock:
-            version = self.schemas.init_table(table, columns)
-            logger.info("[DDL] table=%s action=INIT version=%s columns=%s",
-                        table, version, [c.name for c in columns])
+            version = self.schemas.init_table(table, columns, key_columns)
+            logger.info("[DDL] table=%s action=INIT version=%s columns=%s keys=%s",
+                        table, version, [c.name for c in columns],
+                        list(key_columns))
             return version
 
     def alter_schema(self, table: str, change: SchemaChange) -> SchemaChange:
@@ -242,6 +282,220 @@ class Pipeline:
             batch_id=batch.batch_id, table=table, schema_version=current_version,
             accepted_count=len(aligned_rows), rejected=rejected_results,
             checkpoint=new_checkpoint, replay=False)
+
+    # ---------------- 跨表业务批次（结算：更正 / 撤回） ----------------
+    def submit_business_batch(self, batch: BusinessBatch) -> BusinessBatchResult:
+        """跨表业务批次整体提交：所有表都生效，或所有表都不生效。
+
+        顺序保证：先按表名排序获取全部相关表锁（与单表提交 / DDL 共用同一把锁，
+        避免死锁且保证业务提交、正常增量、结构变化三者可线性化）；
+        在锁内完成「校验 -> 分配顺序号 -> 单次 journal 追加」，
+        journal 追加成功即唯一原子提交点。返回后所有表结论同时可见。
+        """
+        tables_in_batch = sorted({op.table for op in batch.ops})
+        locks = [self._table_lock(t) for t in tables_in_batch]
+        for lk in locks:
+            lk.acquire()
+        try:
+            return self._business_locked(batch)
+        finally:
+            for lk in reversed(locks):
+                lk.release()
+
+    def _business_reject(self, batch: BusinessBatch, reason: RejectReason,
+                         detail: str, table: str = "",
+                         key: tuple[object, ...] | None = None) -> BusinessBatchRejected:
+        logger.info("[BIZ-BATCH] batch=%s REJECT table=%s key=%s reason=%s detail=%s",
+                    batch.batch_id, table, key, reason.value, detail)
+        return BusinessBatchRejected(reason, detail, batch_id=batch.batch_id,
+                                     table=table, key=key)
+
+    def _business_locked(self, batch: BusinessBatch) -> BusinessBatchResult:
+        # 幂等：同一业务批次（全局 batch_id）重复提交 -> 回放首次结论，不二次追加
+        existing = self.ledger.find(batch.batch_id)
+        if existing is not None:
+            result = self._business_result_from_entry(existing, replay=True)
+            logger.info("[BIZ-BATCH] batch=%s REPLAY sequence=%s",
+                        batch.batch_id, existing["sequence"])
+            return result
+
+        if not batch.ops:
+            raise self._business_reject(batch, RejectReason.OFFSET_GAP,
+                                        "业务批次为空，拒绝提交")
+
+        view = self.ledger.fold(self.ledger.read_commits())
+
+        # ---- 逐表准备与校验（任何失败都在追加前，无任何写入） ----
+        prepared_tables: dict[str, dict] = {}
+        seen_keys: set[tuple[str, tuple[object, ...]]] = set()
+        for op in batch.ops:
+            table = op.table
+            if not self.schemas.is_initialized(table):
+                raise self._business_reject(
+                    batch, RejectReason.UNKNOWN_COLUMN,
+                    f"table={table} 不存在", table, op.key)
+            key_cols = self.schemas.key_columns(table)
+            if not key_cols:
+                raise self._business_reject(
+                    batch, RejectReason.TABLE_NOT_KEYED,
+                    f"table={table} 未声明业务键列，不能按业务键更正/撤回",
+                    table, op.key)
+            if len(op.key) != len(key_cols):
+                raise self._business_reject(
+                    batch, RejectReason.KEY_MISMATCH,
+                    f"table={table} 业务键应包含 {len(key_cols)} 列 {list(key_cols)}，"
+                    f"实际 {len(op.key)} 个值 {list(op.key)}", table, op.key)
+            # 键值类型按键列校验，避免 1 与 "1" 错位成两条结果
+            col_by_name = {c.name: c for c in self.schemas.columns(table)}
+            for name, value in zip(key_cols, op.key):
+                self._check_key_value_type(batch, table, op.key,
+                                           col_by_name[name], value)
+            if op.op_type not in (OpType.UPSERT, OpType.RETRACT):
+                raise self._business_reject(
+                    batch, RejectReason.INVALID_OPERATION,
+                    f"table={table} key={op.key} 未知操作类型 {op.op_type!r}",
+                    table, op.key)
+            if op.op_type == OpType.RETRACT and op.data:
+                raise self._business_reject(
+                    batch, RejectReason.INVALID_OPERATION,
+                    f"table={table} key={op.key} 撤回操作不得携带数据",
+                    table, op.key)
+
+            ident = (table, op.key)
+            if ident in seen_keys:
+                raise self._business_reject(
+                    batch, RejectReason.DUPLICATE_KEY_IN_BATCH,
+                    f"table={table} key={op.key} 在同一业务批次内出现多次，"
+                    "批内结论顺序无法确定", table, op.key)
+            seen_keys.add(ident)
+
+            # 确定性顺序：revision 必须严格新于该键已生效的最后结论，
+            # 防止旧更正覆盖新值 / 撤回后旧结论“复活”
+            current = view.get(table, op.key)
+            if current is not None and op.revision <= current.revision:
+                raise self._business_reject(
+                    batch, RejectReason.STALE_REVISION,
+                    f"table={table} key={op.key} 提交 revision={op.revision}，"
+                    f"已生效结论 revision={current.revision}（来自批次 "
+                    f"{current.batch_id}），旧版本不得翻案", table, op.key)
+
+            # 结构版本：以提交时刻当前结构为准对齐，整个批次在同一锁点内解释，
+            # 不会出现同一批更正一半落在改名前字段、一半落在改名后字段
+            cur_version = self.schemas.current_version(table)
+            if batch.schema_version > cur_version:
+                raise self._business_reject(
+                    batch, RejectReason.SCHEMA_VERSION_AHEAD,
+                    f"批次基于版本 {batch.schema_version}，table={table} 当前仅 "
+                    f"{cur_version}", table, op.key)
+            aligned: dict[str, object] | None = None
+            if op.op_type == OpType.UPSERT:
+                if not op.data:
+                    raise self._business_reject(
+                        batch, RejectReason.INVALID_OPERATION,
+                        f"table={table} key={op.key} 更正/写入缺少数据",
+                        table, op.key)
+                rec_version = op.op_schema_version or batch.schema_version
+                aligned = self._align_business_op(batch, op, rec_version)
+
+            prepared_tables.setdefault(table, {
+                "table": table, "schema_version": cur_version, "ops": []})
+            prepared_tables[table]["ops"].append({
+                "op_type": op.op_type.value,
+                "key": list(op.key),
+                "revision": op.revision,
+                "data": aligned,
+                "op_schema_version": op.op_schema_version or batch.schema_version,
+            })
+
+        # ---- 原子提交：一次 journal 追加 = 所有表同时生效 ----
+        sequence = self.ledger.max_sequence() + 1
+        entry = {
+            "batch_id": batch.batch_id,
+            "sequence": sequence,
+            "schema_version_head": batch.schema_version,
+            "tables": [prepared_tables[t] for t in sorted(prepared_tables)],
+        }
+        if self._crash_before_business_commit:
+            self._crash_before_business_commit = False
+            raise RuntimeError("SIMULATED CRASH before journal append")
+        self.ledger.append_commit(entry)
+
+        logger.info(
+            "[BIZ-BATCH] batch=%s COMMIT sequence=%s tables=%s ops=%s",
+            batch.batch_id, sequence,
+            [t["table"] for t in entry["tables"]],
+            sum(len(t["ops"]) for t in entry["tables"]))
+        return self._business_result_from_entry(entry, replay=False)
+
+    def _check_key_value_type(self, batch: BusinessBatch, table: str,
+                              key: tuple[object, ...], col, value: object) -> None:
+        from app.target import _TYPE_CHECKS
+        expected = _TYPE_CHECKS.get(col.typ)
+        if value is None or expected is None or not isinstance(value, expected) or \
+                (col.typ == "int" and isinstance(value, bool)):
+            raise self._business_reject(
+                batch, RejectReason.KEY_MISMATCH,
+                f"table={table} 键列 {col.name!r} 期望 {col.typ}，"
+                f"实际值 {value!r}（{type(value).__name__}）", table, key)
+
+    def _align_business_op(self, batch: BusinessBatch, op: BusinessOp,
+                           rec_version: int) -> dict[str, object]:
+        table = op.table
+        cur_version = self.schemas.current_version(table)
+        if rec_version > cur_version:
+            raise self._business_reject(
+                batch, RejectReason.SCHEMA_VERSION_AHEAD,
+                f"table={table} key={op.key} 操作基于版本 {rec_version}，"
+                f"目标当前 {cur_version}", table, op.key)
+        current_columns = self.schemas.columns(table)
+        old_columns = self.schemas.columns_at(table, rec_version)
+        changes = self.schemas.changes(table)
+        err, aligned = self.target.align_record(
+            dict(op.data or {}), rec_version, current_columns, old_columns, changes)
+        if err is not None:
+            # 精确到：业务批次 / 表 / 业务键 / 数据类别（reason）
+            raise self._business_reject(
+                batch, err.reason,
+                f"table={table} key={op.key} 数据校验失败：{err.detail}",
+                table, op.key)
+        return aligned
+
+    @staticmethod
+    def _business_result_from_entry(entry: dict,
+                                    replay: bool) -> BusinessBatchResult:
+        outcomes = [
+            TableOutcome(table=t["table"], accepted=True, ops=len(t["ops"]),
+                         schema_version=t["schema_version"])
+            for t in entry["tables"]]
+        return BusinessBatchResult(
+            batch_id=entry["batch_id"], committed=True,
+            sequence=entry["sequence"], tables=outcomes, replay=replay)
+
+    # ---------------- 业务结论查询 ----------------
+    def business_view(self) -> LedgerView:
+        return self.ledger.fold(self.ledger.read_commits())
+
+    def current_conclusion(self, table: str,
+                           key: tuple[object, ...]) -> Conclusion | None:
+        """查询某业务键当前最后一次有效结论；撤回后返回状态为 RETRACT 的结论。"""
+        return self.business_view().get(table, key)
+
+    def current_business_rows(self, table: str) -> list[dict]:
+        """当前状态：只返回未撤回（最后一次有效结论为 UPSERT）的业务数据。"""
+        return [dict(c.data) for c in self.business_view().live_rows(table)]
+
+    def business_history(self, table: str,
+                         key: tuple[object, ...]) -> list[dict]:
+        """该业务键经历过的全部更正/撤回轨迹（处理痕迹不抹除，可解释）。"""
+        hist = self.business_view().history.get((table, key), [])
+        return [{
+            "batch_id": c.batch_id, "sequence": c.sequence,
+            "revision": c.revision, "status": c.status.value,
+            "data": c.data, "schema_version": c.schema_version,
+        } for c in hist]
+
+    def business_trace(self, batch_id: str) -> dict | None:
+        return self.ledger.find(batch_id)
 
     # ---------------- 从源端拉取一轮 ----------------
     def run_once(self, table: str, source: LocalSource, batch_id: str,

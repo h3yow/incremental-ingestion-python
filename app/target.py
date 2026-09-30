@@ -30,16 +30,21 @@ class TargetTable:
         self.rows = rows_store
 
     def load(self, table: str) -> list[dict]:
-        """读取某张表已落地的数据行（仅业务字段）。"""
-        return [dict(r["data"]) for r in self.rows.read_all() if r["table"] == table]
+        """读取某张表已落地的增量数据行（仅业务字段，不含更正/撤回事件）。"""
+        return [dict(r["data"]) for r in self.rows.read_all()
+                if r["table"] == table and r.get("kind") is None]
 
-    def write_row(self, table: str, offset: int, row: dict, schema_version: int) -> None:
-        self.rows.append({
+    def write_row(self, table: str, offset: int, row: dict, schema_version: int,
+                  seq: int | None = None) -> None:
+        event = {
             "table": table,
             "offset": offset,
             "schema_version": schema_version,
             "data": row,
-        })
+        }
+        if seq is not None:
+            event["seq"] = seq
+        self.rows.append(event)
 
     @staticmethod
     def _rename_mapping(changes) -> dict[str, str]:

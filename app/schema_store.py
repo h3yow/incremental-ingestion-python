@@ -44,6 +44,15 @@ class SchemaStore:
         return any(e["table"] == table and e["change_type"] == _INIT
                    for e in self.changelog.read_all())
 
+    def key_col(self, table: str) -> str:
+        """该表的业务键列名（更正/撤回按此定位历史结果）；缺省为初始首列。"""
+        for e in self.changelog.read_all():
+            if e["table"] == table and e["change_type"] == _INIT:
+                if e.get("key_col"):
+                    return e["key_col"]
+                return e["columns"][0]["name"]
+        raise SchemaError(f"table={table} 尚未初始化")
+
     def changes(self, table: str) -> list[SchemaChange]:
         out = []
         for e in self.changelog.read_all():
@@ -95,7 +104,8 @@ class SchemaStore:
         with self.changelog.lock():
             self.changelog.append(event)
 
-    def init_table(self, table: str, columns: list[Column]) -> int:
+    def init_table(self, table: str, columns: list[Column],
+                   key_col: str | None = None) -> int:
         with self.changelog.lock():
             if self.is_initialized(table):
                 raise SchemaError(f"table={table} 已初始化，禁止重复建表")
@@ -104,8 +114,12 @@ class SchemaStore:
             names = [c.name for c in columns]
             if len(set(names)) != len(names):
                 raise SchemaError("列名重复")
+            key_col = key_col or names[0]
+            if key_col not in names:
+                raise SchemaError(f"业务键列 {key_col!r} 不在列定义中")
             self._append({
                 "table": table, "version": 1, "change_type": _INIT,
+                "key_col": key_col,
                 "columns": [_column_to_dict(c) for c in columns],
             })
             return 1

@@ -53,3 +53,14 @@ class CheckpointStore:
             return current
         self.kv.put(table, {"checkpoint": new})
         return new
+
+    def ensure(self, table: str, target: int) -> int:
+        """幂等推进到 ``target``：已达/超过则保持，绝不回退。
+
+        用于两阶段提交的崩溃重放：位点只会被抬到 PREPARED 文档记录的边界。
+        """
+        current = self.get(table)
+        if target <= current:
+            return current
+        self.kv.put(table, {"checkpoint": target})
+        return target

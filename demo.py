@@ -10,9 +10,10 @@ import logging
 import shutil
 from pathlib import Path
 
-from app.models import (Batch, ChangeType, Column, Record, RejectReason,
-                        SchemaChange)
-from app.pipeline import BatchRejected, Pipeline
+from app.models import (Batch, BusinessBatch, ChangeType, Column,
+                        CorrectionBatch, CorrectionItem, EventKind, Record,
+                        RejectReason, SchemaChange, TableBatchEntry)
+from app.pipeline import BatchRejected, BusinessBatchRejected, Pipeline
 from app.source import LocalSource
 from app.storage import JsonlStore
 
@@ -76,5 +77,78 @@ def main() -> None:
     print("最终快照：", p.snapshot("orders"))
 
 
+def settlement_demo(p: Pipeline) -> None:
+    """结算链路：跨表业务批次整体提交 + 历史更正/撤回。"""
+    print("\n===== 结算链路演示 =====")
+    p.init_table("settle_orders",
+                 [Column("settle_id", "str"), Column("amount", "int")],
+                 key_col="settle_id")
+    p.init_table("settle_details",
+                 [Column("line_id", "str"), Column("settle_id", "str"),
+                  Column("item", "str"), Column("qty", "int")],
+                 key_col="line_id")
+
+    # 1) 一次结算同时影响订单表与明细表：整体生效
+    txn = BusinessBatch("S2026093001", [
+        TableBatchEntry("settle_orders", [
+            Record(1, {"settle_id": "S001", "amount": 100}, 1)], 1),
+        TableBatchEntry("settle_details", [
+            Record(1, {"line_id": "S001-book", "settle_id": "S001",
+                       "item": "book", "qty": 1}, 1),
+            Record(2, {"line_id": "S001-pen", "settle_id": "S001",
+                       "item": "pen", "qty": 2}, 1)], 1),
+    ])
+    print("跨表结算提交：", p.submit_business_batch(txn).committed)
+    print("重复提交回放：", p.submit_business_batch(txn).replay)
+
+    # 2) 明细表中途出错：两表都不生效，留痕精确定位
+    bad = BusinessBatch("S2026093002", [
+        TableBatchEntry("settle_orders", [
+            Record(2, {"settle_id": "S002", "amount": 200}, 1)], 1),
+        TableBatchEntry("settle_details", [
+            Record(3, {"line_id": "S002-bad", "settle_id": "S002",
+                       "item": "bad", "qty": "X"}, 1)], 1),
+    ])
+    try:
+        p.submit_business_batch(bad)
+    except BusinessBatchRejected as exc:
+        print("跨表失败定位：",
+              [(f.table, f.reason.value, f.detail) for f in exc.failures])
+    print("失败后订单表仍只有：",
+          [r["settle_id"] for r in p.target.load("settle_orders")])
+
+    # 3) 上游对历史结果 S001 发起更正（金额 100 -> 120，明细数量 1 -> 3），跨表一起更正
+    corr = CorrectionBatch("FIX-S001-1", [
+        CorrectionItem("settle_orders", "S001", EventKind.UPSERT, 1,
+                       {"settle_id": "S001", "amount": 120}),
+        CorrectionItem("settle_details", "S001-book", EventKind.UPSERT, 1,
+                       {"line_id": "S001-book", "settle_id": "S001",
+                        "item": "book", "qty": 3}),
+    ])
+    print("历史更正提交：", p.submit_correction(corr).committed)
+    print("更正重复提交回放：", p.submit_correction(corr).replay)
+    print("当前订单状态：", p.current_state("settle_orders"))
+    print("S001 经历过的结论：",
+          [(e["kind"], e["data"]) for e in p.key_history("settle_orders", "S001")])
+
+    # 4) 撤回历史结果 S001：订单与其明细行当前状态不可见，留痕仍在
+    wd = CorrectionBatch("WD-S001", [
+        CorrectionItem("settle_orders", "S001", EventKind.WITHDRAW, 1),
+        CorrectionItem("settle_details", "S001-book", EventKind.WITHDRAW, 1),
+        CorrectionItem("settle_details", "S001-pen", EventKind.WITHDRAW, 1),
+    ])
+    p.submit_correction(wd)
+    print("撤回后当前状态：orders=", p.current_state("settle_orders"),
+          "details=", p.current_state("settle_details"))
+    print("撤回后历史仍可解释：",
+          [e["kind"] for e in p.key_history("settle_orders", "S001")])
+
+
 if __name__ == "__main__":
     main()
+    # 结算链路使用独立目录，避免覆盖上面的单表演示数据
+    demo_root = Path("data_demo/settlement")
+    import shutil
+    shutil.rmtree(demo_root, ignore_errors=True)
+    sp = Pipeline(str(demo_root))
+    settlement_demo(sp)

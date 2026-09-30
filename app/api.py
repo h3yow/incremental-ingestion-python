@@ -21,8 +21,10 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from app.models import (Batch, ChangeType, Column, Record, SchemaChange)
-from app.pipeline import BatchRejected, Pipeline
+from app.models import (Batch, BusinessBatch, ChangeType, Column,
+                        CorrectionBatch, CorrectionItem, EventKind, Record,
+                        SchemaChange, TableBatchEntry)
+from app.pipeline import (BatchRejected, BusinessBatchRejected, Pipeline)
 from app.schema_store import SchemaError
 from app.source import LocalSource
 from app.storage import JsonlStore
@@ -37,6 +39,7 @@ class ColumnIn(BaseModel):
 
 class InitIn(BaseModel):
     columns: list[ColumnIn]
+    key_col: str | None = None
 
 
 class SchemaChangeIn(BaseModel):
@@ -68,6 +71,31 @@ class RunIn(BaseModel):
     limit: int = 100
 
 
+class TableEntryIn(BaseModel):
+    table: str
+    schema_version: int
+    records: list[RecordIn]
+    op: Literal["APPEND"] = "APPEND"
+
+
+class BusinessBatchIn(BaseModel):
+    business_batch_id: str
+    entries: list[TableEntryIn]
+
+
+class CorrectionItemIn(BaseModel):
+    table: str
+    key: Any
+    op: Literal["UPSERT", "WITHDRAW"]
+    schema_version: int
+    data: dict[str, Any] | None = None
+
+
+class CorrectionIn(BaseModel):
+    correction_id: str
+    items: list[CorrectionItemIn]
+
+
 def _column(inp: ColumnIn) -> Column:
     return Column(name=inp.name, typ=inp.typ,
                   required=inp.required, default=inp.default)
@@ -85,13 +113,24 @@ def create_app(pipeline: Pipeline | None = None,
         return HTTPException(status_code=409,
                              detail={"reason": exc.reason.value, "message": str(exc)})
 
+    def business_conflict(exc: BusinessBatchRejected) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "txn_id": exc.txn_id,
+            "message": str(exc),
+            "failures": [{"table": f.table, "reason": f.reason.value,
+                          "detail": f.detail, "offset": f.offset, "key": f.key}
+                         for f in exc.failures],
+        })
+
     @app.post("/tables/{table}/init")
     def init_table(table: str, body: InitIn):
         try:
-            version = pipeline.init_table(table, [_column(c) for c in body.columns])
+            version = pipeline.init_table(
+                table, [_column(c) for c in body.columns], key_col=body.key_col)
         except SchemaError as exc:
             raise HTTPException(status_code=409, detail={"message": str(exc)})
-        return {"table": table, "schema_version": version}
+        return {"table": table, "schema_version": version,
+                "key_col": pipeline.schemas.key_col(table)}
 
     @app.get("/tables/{table}")
     def snapshot(table: str):
@@ -166,4 +205,83 @@ def create_app(pipeline: Pipeline | None = None,
         return {"batch_id": result.batch_id, "checkpoint": result.checkpoint,
                 "accepted_count": result.accepted_count, "replay": result.replay}
 
+    # -------- 跨表业务批次 / 更正 / 撤回 / 当前状态 --------
+    @app.post("/business-batches")
+    def submit_business_batch(body: BusinessBatchIn):
+        entries = []
+        for e in body.entries:
+            if any(r.offset is None for r in e.records):
+                raise HTTPException(status_code=422,
+                                    detail={"message": "每条记录必须带源端 offset"})
+            records = [Record(offset=r.offset, data=r.data,
+                              schema_version=r.schema_version) for r in e.records]
+            entries.append(TableBatchEntry(
+                table=e.table, records=records, schema_version=e.schema_version))
+        try:
+            result = pipeline.submit_business_batch(
+                BusinessBatch(body.business_batch_id, entries))
+        except BusinessBatchRejected as exc:
+            raise business_conflict(exc)
+        return _business_result_json(result)
+
+    @app.post("/corrections")
+    def submit_correction(body: CorrectionIn):
+        items = [CorrectionItem(table=i.table, key=i.key,
+                                op=EventKind(i.op),
+                                schema_version=i.schema_version, data=i.data)
+                 for i in body.items]
+        try:
+            result = pipeline.submit_correction(
+                CorrectionBatch(body.correction_id, items))
+        except BusinessBatchRejected as exc:
+            raise business_conflict(exc)
+        return _business_result_json(result)
+
+    @app.get("/transactions/{txn_id}")
+    def get_transaction(txn_id: str):
+        trace = pipeline.business_trace(txn_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail={"message": "事务不存在"})
+        return trace
+
+    @app.get("/tables/{table}/state")
+    def current_state(table: str):
+        try:
+            state = pipeline.current_state(table)
+        except SchemaError as exc:
+            raise HTTPException(status_code=404, detail={"message": str(exc)})
+        # JSON 对象键必须是字符串
+        return {"table": table,
+                "state": {str(k): v for k, v in state.items()}}
+
+    @app.get("/tables/{table}/state/history")
+    def key_history(table: str, key: str):
+        # 业务键类型与业务键列一致：能解析为 int 则按 int 匹配
+        lookup: Any = int(key) if key.lstrip("-").isdigit() else key
+        try:
+            events = pipeline.key_history(table, lookup)
+        except SchemaError as exc:
+            raise HTTPException(status_code=404, detail={"message": str(exc)})
+        if not events:
+            raise HTTPException(status_code=404,
+                                detail={"message": "该业务键无任何事件"})
+        return {"table": table, "key": lookup, "history": events}
+
     return app
+
+
+def _business_result_json(result) -> dict:
+    return {
+        "business_batch_id": result.business_batch_id,
+        "committed": result.committed,
+        "state": result.state.value,
+        "replay": result.replay,
+        "entries": [{"table": e.table, "accepted_count": e.accepted_count,
+                     "checkpoint": e.checkpoint,
+                     "reason": e.reason.value if e.reason else None,
+                     "detail": e.detail,
+                     "rejected": [{"offset": r.offset,
+                                   "reason": r.reason.value if r.reason else None,
+                                   "detail": r.detail} for r in e.rejected]}
+                    for e in result.entries],
+    }

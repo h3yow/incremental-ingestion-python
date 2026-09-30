@@ -85,3 +85,78 @@ class ApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BusinessAndCorrectionApiTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        pipeline = Pipeline(root)
+        self.source = LocalSource(
+            JsonlStore(f"{root}/source.jsonl", lock=pipeline._store_lock))
+        self.client = TestClient(create_app(pipeline, self.source))
+        for table, col in [("orders", "amount"), ("details", "qty")]:
+            r = self.client.post(f"/tables/{table}/init", json={
+                "columns": [{"name": "id", "typ": "int"},
+                            {"name": col, "typ": "int"}]})
+            self.assertEqual(r.status_code, 200)
+        # 一个跨表业务批次
+        r = self.client.post("/business-batches", json={
+            "business_batch_id": "set-1", "entries": [
+                {"table": "orders", "schema_version": 1,
+                 "records": [{"offset": 1, "data": {"id": 1, "amount": 100}}]},
+                {"table": "details", "schema_version": 1,
+                 "records": [{"offset": 1, "data": {"id": 1, "qty": 2}}]}]})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["committed"])
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_cross_table_failure_returns_locating_409(self):
+        r = self.client.post("/business-batches", json={
+            "business_batch_id": "set-bad", "entries": [
+                {"table": "orders", "schema_version": 1,
+                 "records": [{"offset": 2, "data": {"id": 2, "amount": 1}}]},
+                {"table": "details", "schema_version": 1,
+                 "records": [{"offset": 2, "data": {"id": 2, "qty": "X"}}]}]})
+        self.assertEqual(r.status_code, 409)
+        failure = r.json()["detail"]["failures"][0]
+        self.assertEqual(failure["table"], "details")
+        self.assertEqual(failure["reason"], "TYPE_MISMATCH")
+        self.assertEqual(failure["offset"], 2)
+        # 未半生效：orders 快照仍只有 1 行
+        self.assertEqual(len(self.client.get("/tables/orders").json()["rows"]), 1)
+
+    def test_correction_withdraw_state_and_history_over_http(self):
+        # 更正重复提交回放
+        body = {"correction_id": "c1", "items": [
+            {"table": "orders", "key": 1, "op": "UPSERT", "schema_version": 1,
+             "data": {"id": 1, "amount": 999}}]}
+        self.assertFalse(self.client.post("/corrections", json=body).json()["replay"])
+        self.assertTrue(self.client.post("/corrections", json=body).json()["replay"])
+        state = self.client.get("/tables/orders/state").json()["state"]
+        self.assertEqual(state, {"1": {"id": 1, "amount": 999}})
+
+        # 撤回 details 1 后当前状态消失，但历史仍可解释
+        r = self.client.post("/corrections", json={
+            "correction_id": "w1", "items": [
+                {"table": "details", "key": 1, "op": "WITHDRAW",
+                 "schema_version": 1}]})
+        self.assertTrue(r.json()["committed"])
+        self.assertEqual(self.client.get("/tables/details/state").json()["state"],
+                         {})
+        hist = self.client.get(
+            "/tables/details/state/history?key=1").json()["history"]
+        self.assertEqual([e["kind"] for e in hist], ["UPSERT", "WITHDRAW"])
+
+        # 撤回不存在的键：409 + KEY_NOT_FOUND，事务留痕为 ABORTED
+        r = self.client.post("/corrections", json={
+            "correction_id": "w2", "items": [
+                {"table": "details", "key": 99, "op": "WITHDRAW",
+                 "schema_version": 1}]})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["failures"][0]["reason"],
+                         "KEY_NOT_FOUND")
+        self.assertEqual(self.client.get("/transactions/w2").json()["state"],
+                         "ABORTED")

@@ -160,3 +160,112 @@ class BusinessAndCorrectionApiTest(unittest.TestCase):
                          "KEY_NOT_FOUND")
         self.assertEqual(self.client.get("/transactions/w2").json()["state"],
                          "ABORTED")
+
+
+class BugfixApiTest(unittest.TestCase):
+    """bugfix-b 新增 HTTP 语义：发起序号裁决、DDL 战役、业务键列保护、改名定位。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = self._tmp.name
+        pipeline = Pipeline(root)
+        self.source = LocalSource(
+            JsonlStore(f"{root}/source.jsonl", lock=pipeline._store_lock))
+        self.client = TestClient(create_app(pipeline, self.source))
+        self.client.post("/tables/orders/init", json={
+            "columns": [{"name": "settle_id", "typ": "str"},
+                        {"name": "amount", "typ": "int"}],
+            "key_col": "settle_id"})
+        self.client.post("/tables/details/init", json={
+            "columns": [{"name": "settle_id", "typ": "str"},
+                        {"name": "qty", "typ": "int"}],
+            "key_col": "settle_id"})
+        self.client.post("/business-batches", json={
+            "business_batch_id": "S1", "entries": [
+                {"table": "orders", "schema_version": 1,
+                 "records": [{"offset": 1,
+                              "data": {"settle_id": "S1", "amount": 100}}]},
+                {"table": "details", "schema_version": 1,
+                 "records": [{"offset": 1,
+                              "data": {"settle_id": "S1", "qty": 2}}]}]})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_stale_issued_seq_returns_409_and_keeps_newer(self):
+        r1 = self.client.post("/corrections", json={
+            "correction_id": "new", "items": [
+                {"table": "orders", "key": "S1", "op": "UPSERT",
+                 "schema_version": 1, "issued_seq": 10,
+                 "data": {"settle_id": "S1", "amount": 150}}]})
+        self.assertEqual(r1.status_code, 200)
+        r2 = self.client.post("/corrections", json={
+            "correction_id": "old", "items": [
+                {"table": "orders", "key": "S1", "op": "UPSERT",
+                 "schema_version": 1, "issued_seq": 5,
+                 "data": {"settle_id": "S1", "amount": 110}}]})
+        self.assertEqual(r2.status_code, 409)
+        self.assertEqual(r2.json()["detail"]["failures"][0]["reason"],
+                         "STALE_CORRECTION")
+        state = self.client.get("/tables/orders/state").json()["state"]
+        self.assertEqual(state["S1"]["amount"], 150)
+
+    def test_drop_key_column_returns_distinguishable_409(self):
+        r = self.client.post("/tables/orders/schema", json={
+            "change_type": "drop_column", "column_name": "settle_id"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["reason"],
+                         "KEY_COLUMN_PROTECTED")
+
+    def test_rename_key_column_then_state_and_correction(self):
+        r = self.client.post("/tables/orders/schema", json={
+            "change_type": "rename_column",
+            "column_name": "settle_id", "to_name": "biz_id"})
+        self.assertEqual(r.status_code, 200)
+        # 老结果改名后仍可按原业务键值查到，并可用新列名更正
+        state = self.client.get("/tables/orders/state").json()["state"]
+        self.assertIn("S1", state)
+        rc = self.client.post("/corrections", json={
+            "correction_id": "fix", "items": [
+                {"table": "orders", "key": "S1", "op": "UPSERT",
+                 "schema_version": 2,
+                 "data": {"biz_id": "S1", "amount": 120}}]})
+        self.assertEqual(rc.status_code, 200)
+        state = self.client.get("/tables/orders/state").json()["state"]
+        self.assertEqual(state["S1"]["amount"], 120)
+        self.assertEqual(state["S1"]["biz_id"], "S1")
+
+    def test_ddl_campaign_atomic_and_idempotent(self):
+        body = {"campaign_id": "ddl1", "changes": [
+            {"table": "orders", "change_type": "add_column",
+             "column_name": "tag",
+             "column": {"name": "tag", "typ": "str", "required": False}},
+            {"table": "details", "change_type": "add_column",
+             "column_name": "tag",
+             "column": {"name": "tag", "typ": "str", "required": False}}]}
+        r = self.client.post("/schema-campaigns", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            sorted((c["table"], c["schema_version"])
+                   for c in r.json()["changes"]),
+            [("details", 2), ("orders", 2)])
+        # 重复提交：幂等回放，版本不再增长
+        r2 = self.client.post("/schema-campaigns", json=body)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(
+            sorted(c["schema_version"] for c in r2.json()["changes"]), [2, 2])
+
+    def test_ddl_campaign_drop_key_column_aborts_all(self):
+        r = self.client.post("/schema-campaigns", json={
+            "campaign_id": "ddlbad", "changes": [
+                {"table": "orders", "change_type": "drop_column",
+                 "column_name": "settle_id"},
+                {"table": "details", "change_type": "add_column",
+                 "column_name": "tag",
+                 "column": {"name": "tag", "typ": "str", "required": False}}]})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["reason"],
+                         "KEY_COLUMN_PROTECTED")
+        # details 也未生效
+        snap = self.client.get("/tables/details").json()
+        self.assertEqual(snap["schema_version"], 1)

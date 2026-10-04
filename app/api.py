@@ -25,7 +25,7 @@ from app.models import (Batch, BusinessBatch, ChangeType, Column,
                         CorrectionBatch, CorrectionItem, EventKind, Record,
                         SchemaChange, TableBatchEntry)
 from app.pipeline import (BatchRejected, BusinessBatchRejected, Pipeline)
-from app.schema_store import SchemaError
+from app.schema_store import KeyColumnProtectedError, SchemaError
 from app.source import LocalSource
 from app.storage import JsonlStore
 
@@ -47,6 +47,25 @@ class SchemaChangeIn(BaseModel):
     column_name: str
     to_name: str | None = None
     column: ColumnIn | None = None
+    # 仅在 /schema-campaigns（多表 DDL 战役）中使用：单表接口以路径参数为准
+    table: str | None = None
+
+
+class SchemaCampaignIn(BaseModel):
+    """多表结构变更战役：整体校验、整体生效（相对跨表事务不可被插入）。"""
+
+    campaign_id: str
+    changes: list[SchemaChangeIn]
+
+
+def _change_from_in(body: SchemaChangeIn) -> SchemaChange:
+    return SchemaChange(
+        version=0,
+        change_type=ChangeType(body.change_type.upper()),
+        column_name=body.column_name,
+        to_name=body.to_name,
+        column=_column(body.column) if body.column else None,
+    )
 
 
 class RecordIn(BaseModel):
@@ -89,6 +108,9 @@ class CorrectionItemIn(BaseModel):
     op: Literal["UPSERT", "WITHDRAW"]
     schema_version: int
     data: dict[str, Any] | None = None
+    # 上游对同一业务键的更正/撤回发起序号（按发起先后单调递增）；
+    # 缺省/null 表示不提供，系统退化为按到达先后生效，不做新旧裁决。
+    issued_seq: int | None = None
 
 
 class CorrectionIn(BaseModel):
@@ -141,20 +163,45 @@ def create_app(pipeline: Pipeline | None = None,
 
     @app.post("/tables/{table}/schema")
     def alter_schema(table: str, body: SchemaChangeIn):
-        change = SchemaChange(
-            version=0,
-            change_type=ChangeType(body.change_type.upper()),
-            column_name=body.column_name,
-            to_name=body.to_name,
-            column=_column(body.column) if body.column else None,
-        )
         try:
-            result = pipeline.alter_schema(table, change)
+            result = pipeline.alter_schema(table, _change_from_in(body))
+        except KeyColumnProtectedError as exc:
+            # 业务键列保护：给出可区分原因，便于上游按原因处理
+            raise HTTPException(status_code=409, detail={
+                "reason": "KEY_COLUMN_PROTECTED", "message": str(exc)})
         except SchemaError as exc:
             raise HTTPException(status_code=409, detail={"message": str(exc)})
         return {"table": table, "schema_version": result.version,
                 "change_type": result.change_type.value,
                 "column_name": result.column_name, "to_name": result.to_name}
+
+    @app.post("/schema-campaigns")
+    def alter_schemas(body: SchemaCampaignIn):
+        """多表结构变更整体提交（DDL 战役）：全部生效或全部不生效。
+
+        幂等键为 campaign_id；跨表更正/业务事务与战役严格整体在前或在后，
+        不会出现一半表新结构、一半表旧结构。
+        """
+        # SchemaChangeIn 通过可选 table 字段携带目标表
+        pairs = []
+        for c in body.changes:
+            if not c.table:
+                raise HTTPException(status_code=422, detail={
+                    "message": "DDL 战役中每条变更必须带 table"})
+            pairs.append((c.table, _change_from_in(c)))
+        try:
+            results = pipeline.alter_schemas(body.campaign_id, pairs)
+        except KeyColumnProtectedError as exc:
+            raise HTTPException(status_code=409, detail={
+                "reason": "KEY_COLUMN_PROTECTED", "message": str(exc)})
+        except SchemaError as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc)})
+        return {"campaign_id": body.campaign_id,
+                "changes": [{"table": tbl, "schema_version": r.version,
+                             "change_type": r.change_type.value,
+                             "column_name": r.column_name,
+                             "to_name": r.to_name}
+                            for (tbl, _), r in zip(pairs, results)]}
 
     @app.post("/tables/{table}/batches")
     def submit_batch(table: str, body: BatchIn):
@@ -228,7 +275,8 @@ def create_app(pipeline: Pipeline | None = None,
     def submit_correction(body: CorrectionIn):
         items = [CorrectionItem(table=i.table, key=i.key,
                                 op=EventKind(i.op),
-                                schema_version=i.schema_version, data=i.data)
+                                schema_version=i.schema_version, data=i.data,
+                                issued_seq=i.issued_seq)
                  for i in body.items]
         try:
             result = pipeline.submit_correction(

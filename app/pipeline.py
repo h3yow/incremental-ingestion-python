@@ -26,8 +26,9 @@ from pathlib import Path
 
 from app.checkpoint import CheckpointStore, OffsetError
 from app.models import (Batch, BatchResult, BusinessBatch, BusinessBatchResult,
-                        Column, CorrectionBatch, EntryResult, EventKind,
-                        RecordResult, RejectReason, SchemaChange, TxState)
+                        ChangeType, Column, CorrectionBatch, EntryResult,
+                        EventKind, RecordResult, RejectReason, SchemaChange,
+                        TxState)
 from app.schema_store import SchemaError, SchemaStore
 from app.source import LocalSource
 from app.state_store import StateStore
@@ -130,9 +131,11 @@ class Pipeline:
             KVStore(self.root / "seq.json", lock=self._store_lock))
         self.tx_log = TxLog(
             JsonlStore(self.root / "transactions.jsonl", lock=self._store_lock))
+        self._ddl_campaign_store = JsonlStore(
+            self.root / "ddl_campaigns.jsonl", lock=self._store_lock)
         self._batch_store = JsonlStore(self.root / "batches.jsonl",
                                        lock=self._store_lock)
-        self.recover()  # 崩溃恢复：重放仍处于 PREPARED 的业务事务
+        self.recover()  # 崩溃恢复：先补全未完成 DDL 战役，再前滚 PREPARED 业务事务
 
     def _table_lock(self, table: str) -> threading.RLock:
         with self._locks_guard:
@@ -155,28 +158,127 @@ class Pipeline:
             return version
 
     def alter_schema(self, table: str, change: SchemaChange) -> SchemaChange:
-        """在 DDL 协调锁 + 表锁内串行执行结构变更。
+        """单表结构变更（DDL 协调锁 + 表锁内串行执行）。
 
-        协调锁保证：结构变更不会插入到一个跨表业务/更正事务的中间，
-        因而跨表事务的所有表分片按同一结构快照解释。
+        协调锁保证：该变更不会插入到一个**跨表**业务/更正事务的中间。
+        若上游需要同时对多张表做结构变更并要求跨表更正相对它整体在前/在后，
+        必须使用 alter_schemas() 作为一个 DDL 战役整体提交。
         """
-        from app.models import ChangeType
         with self._ddl_lock:
             lock = self._table_lock(table)
             with lock:
-                if change.change_type == ChangeType.ADD_COLUMN:
-                    result = self.schemas.add_column(table, change.column)
-                elif change.change_type == ChangeType.DROP_COLUMN:
-                    result = self.schemas.drop_column(table, change.column_name)
-                elif change.change_type == ChangeType.RENAME_COLUMN:
-                    result = self.schemas.rename_column(
-                        table, change.column_name, change.to_name)
-                else:
-                    raise SchemaError(f"未知变更类型 {change.change_type}")
+                event = self.schemas.plan_change(table, change)
+                result = self.schemas.commit_event(event)
                 logger.info("[DDL] table=%s action=%s version=%s detail=%s->%s",
                             table, result.change_type.value, result.version,
                             result.column_name, result.to_name)
                 return result
+
+    def alter_schemas(self, campaign_id: str,
+                      changes: list[tuple[str, SchemaChange]]) -> list[SchemaChange]:
+        """多表结构变更作为一个 **DDL 战役**整体提交：整体校验、整体可见。
+
+        - 任一张表的任一条变更预检失败 -> 整个战役中止，不写入任何流水，
+          所有表结构版本保持不变（调用方可据此修正后用新 campaign_id 重试）；
+        - 整个战役在 DDL 协调锁 + 全部相关表锁内完成，因此跨表业务/更正事务
+          不可能落在战役中间：它观察到的结构快照要么全部是变更前、要么全部
+          是变更后，不会出现「orders 已加列、details 尚未加列」；
+        - 幂等：相同 campaign_id 直接回放首次结论（不重复分配版本、不重写）；
+        - 崩溃恢复：PREPARED 战役文档（含已确定版本的完整事件）落盘后崩溃，
+          重启时按文档幂等补写缺失事件，跨表事务恢复后面对的仍是同一结构。
+        """
+        if not changes:
+            raise SchemaError("DDL 战役不能为空")
+        tables = sorted({table for table, _ in changes})
+
+        with self._ddl_lock:
+            locks = [self._table_lock(t) for t in tables]
+            for lk in locks:
+                lk.acquire()
+            try:
+                # 幂等（锁内复检，保证并发下相同 campaign_id 也严格回放）：
+                # 已完成的战役直接回放；仍 PREPARED 的战役先补全再回放
+                done = self._find_ddl_campaign(campaign_id)
+                if done is not None:
+                    if done["state"] == TxState.PREPARED.value:
+                        self._apply_ddl_events(done["events"])
+                        done = dict(done, state=TxState.COMMITTED.value)
+                        self._ddl_campaign_store.append(done)
+                    logger.info("[DDL-CAMPAIGN] id=%s REPLAY state=%s",
+                                campaign_id, done["state"])
+                    return self._changes_from_campaign(done)
+
+                # 阶段一：全部校验并分配版本，形成自包含事件文档（尚未写结构流水）
+                events: list[dict] = []
+                for table, change in changes:
+                    events.append(self.schemas.plan_change(table, change))
+                doc = {"campaign_id": campaign_id,
+                       "state": TxState.PREPARED.value, "events": events}
+                self._ddl_campaign_store.append(doc)
+
+                # 阶段二：幂等落盘全部事件并追加 COMMITTED
+                self._apply_ddl_events(events)
+                committed = dict(doc, state=TxState.COMMITTED.value)
+                self._ddl_campaign_store.append(committed)
+                for e in events:
+                    logger.info(
+                        "[DDL] table=%s action=%s version=%s detail=%s->%s "
+                        "campaign=%s",
+                        e["table"], e["change_type"], e["version"],
+                        e["column_name"], e.get("to_name"), campaign_id)
+                logger.info("[DDL-CAMPAIGN] id=%s COMMITTED tables=%s",
+                            campaign_id, tables)
+                return self._changes_from_campaign(committed)
+            finally:
+                for lk in reversed(locks):
+                    lk.release()
+
+    @staticmethod
+    def _changes_from_campaign(doc: dict) -> list[SchemaChange]:
+        out = []
+        for e in doc["events"]:
+            col = Column(**e["column"]) if e.get("column") else None
+            out.append(SchemaChange(
+                version=e["version"], change_type=ChangeType(e["change_type"]),
+                column_name=e["column_name"], to_name=e.get("to_name"),
+                column=col))
+        return out
+
+    def _find_ddl_campaign(self, campaign_id: str) -> dict | None:
+        latest = None
+        for doc in self._ddl_campaign_store.read_all():
+            if doc["campaign_id"] == campaign_id:
+                latest = doc
+        return latest
+
+    def _apply_ddl_events(self, events: list[dict]) -> None:
+        """幂等补写战役事件：已存在（表,版本）则跳过，保证版本号不二次分配。"""
+        existing = {(e["table"], e["version"])
+                    for e in self.schemas.changelog.read_all()}
+        for event in events:
+            if (event["table"], event["version"]) in existing:
+                continue
+            self.schemas.changelog.append(event)
+
+    def _resume_ddl_campaign(self, doc: dict) -> None:
+        """按 PREPARED 战役文档补全缺失的结构事件并追加 COMMITTED。"""
+        tables = sorted({e["table"] for e in doc["events"]})
+        with self._ddl_lock:
+            locks = [self._table_lock(t) for t in tables]
+            for lk in locks:
+                lk.acquire()
+            try:
+                latest = self._find_ddl_campaign(doc["campaign_id"])
+                if latest is not None and latest["state"] == TxState.COMMITTED.value:
+                    return
+                self._apply_ddl_events(doc["events"])
+                committed = dict(doc, state=TxState.COMMITTED.value)
+                self._ddl_campaign_store.append(committed)
+                logger.info("[RECOVER] ddl-campaign=%s rolled forward to COMMITTED",
+                            doc["campaign_id"])
+            finally:
+                for lk in reversed(locks):
+                    lk.release()
 
     # ---------------- 批次留痕 ----------------
     def _find_batch(self, table: str, batch_id: str) -> dict | None:
@@ -555,7 +657,25 @@ class Pipeline:
         self.tx_log.append_state(committed)
 
     def recover(self) -> None:
-        """启动恢复：按落盘顺序重放仍为 PREPARED 的业务事务到同一最终状态。"""
+        """启动恢复：先补全未完成 DDL 战役，再按落盘顺序前滚 PREPARED 事务。
+
+        顺序固定为「结构先于数据」：业务/更正事务的 PREPARED 文档按确定的结构
+        版本对齐过，若其落盘与应用之间穿插过 DDL 战役（战役先于崩溃提交），
+        必须先让结构到达战后版本，重放结果才与崩溃前的线性化结论一致。
+        """
+        # 1) 未完成的 DDL 战役：按各自 PREPARED 文档幂等补全
+        latest: dict[str, dict] = {}
+        order: list[str] = []
+        for doc in self._ddl_campaign_store.read_all():
+            cid = doc["campaign_id"]
+            if cid not in latest:
+                order.append(cid)
+            latest[cid] = doc
+        for cid in order:
+            if latest[cid]["state"] == TxState.PREPARED.value:
+                self._resume_ddl_campaign(latest[cid])
+
+        # 2) PREPARED 的业务/更正事务：幂等前滚到 COMMITTED
         pending = self.tx_log.prepared_open()
         if not pending:
             return
@@ -571,13 +691,52 @@ class Pipeline:
         """查询业务事务留痕（PREPARED/COMMITTED/ABORTED 及逐表结论）。"""
         return self.tx_log.find(txn_id)
 
+    def _key_resolver(self, table: str, version: int | None) -> str:
+        """事件版本 -> 该版本下的业务键列名（沿改名链回放）。
+
+        极早期落盘可能没有 schema_version：回落到建表版本（v1）的键列名。
+        """
+        if version is None:
+            return self.schemas.key_col_at(table, 1)
+        return self.schemas.key_col_at(table, version)
+
+    def _row_normalizer(self, table: str):
+        """返回把任意历史版本行对齐到该表当前结构的归一化函数。
+
+        折叠当前状态时使用：改名/加列/删列之后，不同版本写入的同一业务键结果
+        在当前状态里呈现统一的当前字段集合（老行映射新列名、补加列缺省、
+        丢已删列）。数据在落盘前已校验过，此处只做结构对齐；若意外无法对齐
+        （不应发生）则保留原行，避免查询因历史数据而整体失败。
+        """
+        def normalize(data: dict, version: int | None) -> dict:
+            if not self.schemas.is_initialized(table):
+                return dict(data)
+            cur_version = self.schemas.current_version(table)
+            # 无版本号的极早期落盘固定按建表版本 v1 解释（与键列解析兜底一致）
+            base_version = 1 if version is None else version
+            if base_version == cur_version:
+                return dict(data)
+            try:
+                old_columns = self.schemas.columns_at(table, base_version)
+                err, aligned = self.target.align_record(
+                    data, base_version, self.schemas.columns(table),
+                    old_columns, self.schemas.changes(table))
+            except SchemaError:
+                return dict(data)
+            return dict(data) if err is not None or aligned is None else aligned
+        return normalize
+
     def current_state(self, table: str) -> dict[object, dict]:
-        """查询某表当前状态：仅含最后一次有效结论，不含已撤回键。"""
-        return self.state.current(table, self.schemas.key_col(table))
+        """查询某表当前状态：仅含最后一次有效结论，不含已撤回键。
+
+        返回数据统一按**当前结构**对齐（业务键列改名/加列/删列后仍完整）。
+        """
+        return self.state.current(
+            table, self._key_resolver, self._row_normalizer(table))
 
     def key_history(self, table: str, key: object) -> list[dict]:
         """解释某条业务结果经历过的全部增量写入与更正/撤回。"""
-        return self.state.history(table, key, self.schemas.key_col(table))
+        return self.state.history(table, key, self._key_resolver)
 
     def _validate_correction_item(self, item, failures, plans) -> None:
         """校验单条更正/撤回；成功在 plans 放入待生效事件计划，否则记 failure。"""
@@ -594,8 +753,25 @@ class Pipeline:
                 f"key={item.key!r} 更正基于版本 {item.schema_version}，"
                 f"目标当前 {current_version}", key=item.key))
             return
+
+        # 发起先后裁决（先于键存在性检查）：
+        # 同一业务键已生效过发起序号 >= 本请求的结论时，本请求是「更旧」的，
+        # 无论该键当前是否已撤回，都不得把更新的结论翻回去（整批 ABORT）。
+        max_issued = self.state.max_issued_seq(table, item.key)
+        if item.issued_seq is not None and max_issued is not None \
+                and item.issued_seq <= max_issued:
+            failures.append(EntryFailure(
+                table, RejectReason.STALE_CORRECTION,
+                f"key={item.key!r} 更正/撤回发起序号 {item.issued_seq} "
+                f"不新于已生效结论的最大发起序号 {max_issued}，"
+                f"旧请求不得覆盖更新的结论", key=item.key))
+            return
+
+        # 此后键列名一律使用「当前结构」中的列名：更正数据先按版本对齐到当前
+        # 结构（业务键列改名会被映射到新名），再用新名校验键一致性，
+        # 避免改名后所有更正都被误判为 ENTRY_INVALID。
         key_col = self.schemas.key_col(table)
-        current = self.state.current(table, key_col)
+        current = self.state.current(table, self._key_resolver)
         if item.key not in current:
             failures.append(EntryFailure(
                 table, RejectReason.KEY_NOT_FOUND,
@@ -616,13 +792,6 @@ class Pipeline:
                     table, RejectReason.ENTRY_INVALID,
                     f"key={item.key!r} 更正必须携带完整数据", key=item.key))
                 return
-            # 业务键列必须与目标键一致且存在，防止更正落到错误的键上
-            if item.data.get(key_col) != item.key:
-                failures.append(EntryFailure(
-                    table, RejectReason.ENTRY_INVALID,
-                    f"key={item.key!r} 与数据中的业务键列 {key_col!r}="
-                    f"{item.data.get(key_col)!r} 不一致", key=item.key))
-                return
             changes = self.schemas.changes(table)
             err, aligned = self.target.align_record(
                 item.data, item.schema_version,
@@ -633,6 +802,14 @@ class Pipeline:
                     table, err.reason, f"key={item.key!r} {err.detail}",
                     key=item.key))
                 return
+            # 业务键列必须与目标键一致且存在（对齐后按当前列名比较），
+            # 防止更正落到错误的键上
+            if aligned.get(key_col) != item.key:
+                failures.append(EntryFailure(
+                    table, RejectReason.ENTRY_INVALID,
+                    f"key={item.key!r} 与数据中的业务键列 {key_col!r}="
+                    f"{aligned.get(key_col)!r} 不一致", key=item.key))
+                return
 
         plans.append({
             "type": "correction",
@@ -641,6 +818,7 @@ class Pipeline:
             "op": item.op.value,
             "data": aligned,
             "schema_version": current_version,
+            "issued_seq": item.issued_seq,
         })
 
     def _apply_correction_plan(self, plan: dict) -> None:
@@ -653,7 +831,8 @@ class Pipeline:
         seq = self.state.allocate_write_seq(plan["table"])
         self.state.append_event(
             plan["table"], plan["key"], kind, plan["data"],
-            plan["schema_version"], seq, correction_id)
+            plan["schema_version"], seq, correction_id,
+            issued_seq=plan.get("issued_seq"))
 
     def submit_correction(self, correction: CorrectionBatch) -> BusinessBatchResult:
         """历史更正/撤回请求：按业务键覆盖或撤回，可跨表整体生效，幂等。

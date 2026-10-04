@@ -19,6 +19,8 @@ class RejectReason(str, Enum):
     KEY_NOT_FOUND = "KEY_NOT_FOUND"              # 更正/撤回的业务键当前不存在
     ENTRY_INVALID = "ENTRY_INVALID"              # 跨表业务批次中某个表的数据校验失败
     TABLE_NOT_INITIALIZED = "TABLE_NOT_INITIALIZED"  # 业务批次涉及未建表的表
+    STALE_CORRECTION = "STALE_CORRECTION"        # 更正/撤回的发起序号早于已生效结论
+    KEY_COLUMN_PROTECTED = "KEY_COLUMN_PROTECTED"  # 结构变更试图删除业务键列（更正/撤回的定位锚点）
 
 
 class ChangeType(str, Enum):
@@ -127,6 +129,10 @@ class CorrectionItem:
     op: EventKind
     schema_version: int          # 该更正基于的目标结构版本
     data: dict[str, object] | None = None
+    # 发起序号：上游对「同一业务键」的更正/撤回按发起先后单调递增。
+    # 到达顺序与发起顺序不一致（乱序送达）时，系统据此裁决，旧请求不得翻掉新结论。
+    # 缺省 None 表示调用方不提供，仅按到达（提交）先后生效，不做新旧裁决。
+    issued_seq: int | None = None
 
 
 @dataclass(frozen=True)

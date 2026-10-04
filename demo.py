@@ -52,22 +52,40 @@ def main() -> None:
     ], schema_version=1)
     print("修复重提：", p.submit_batch(fixed))
 
-    # 6) 结构变更：加列(带缺省)、改名、删列，旧版本记录仍可对齐
+    # 6) 结构变更：加列(带缺省)、加可空列、普通列改名、业务键列改名、删非键列。
+    #    业务键列（id）只允许改名、不允许删除——改名后历史结果仍可定位与更正。
     p.alter_schema("orders", SchemaChange(
         0, ChangeType.ADD_COLUMN, "amount",
         column=Column("amount", "float", required=True, default=0.0)))
     p.alter_schema("orders", SchemaChange(
+        0, ChangeType.ADD_COLUMN, "note",
+        column=Column("note", "str", required=False)))
+    p.alter_schema("orders", SchemaChange(
         0, ChangeType.RENAME_COLUMN, "name", to_name="customer"))
     p.alter_schema("orders", SchemaChange(
-        0, ChangeType.DROP_COLUMN, "id"))
+        0, ChangeType.RENAME_COLUMN, "id", to_name="biz_id"))
+    p.alter_schema("orders", SchemaChange(
+        0, ChangeType.DROP_COLUMN, "note"))
+    # 尝试删除业务键列会被明确拒绝（KEY_COLUMN_PROTECTED），且无副作用
+    try:
+        p.alter_schema("orders", SchemaChange(
+            0, ChangeType.DROP_COLUMN, "biz_id"))
+    except Exception as exc:  # noqa: BLE001
+        print("删除业务键列被拒绝：", getattr(exc, "reason", type(exc).__name__),
+              "-", exc)
+    # 改名键列后新数据照常接入，老数据在当前状态中仍完整
     source.produce("orders", {"id": 4, "name": "dave"}, 1)
     result = p.run_once("orders", source, "batch-003")
     print("结构变更后提交：", result)
+    print("改名键列后的当前状态：",
+          {k: v for k, v in p.current_state("orders").items()})
 
-    # 7) 位点回退 / 跳号被明确拒绝
+    # 7) 位点回退 / 跳号被明确拒绝（当前为版本 6，字段为 biz_id/customer/amount）
     for bad_batch in [
-        Batch("back", "orders", [Record(2, {"customer": "x", "amount": 1.0})], 4),
-        Batch("jump", "orders", [Record(99, {"customer": "y", "amount": 2.0})], 4),
+        Batch("back", "orders",
+              [Record(2, {"biz_id": 2, "customer": "x", "amount": 1.0})], 6),
+        Batch("jump", "orders",
+              [Record(99, {"biz_id": 99, "customer": "y", "amount": 2.0})], 6),
     ]:
         try:
             p.submit_batch(bad_batch)
@@ -144,6 +162,72 @@ def settlement_demo(p: Pipeline) -> None:
           [e["kind"] for e in p.key_history("settle_orders", "S001")])
 
 
+def settlement_bugfix_demo(p: Pipeline) -> None:
+    """bugfix-b：键列改名定位、多表 DDL 战役、更正发起先后裁决。"""
+    print("\n===== 结算链路缺陷修复演示 =====")
+    p.init_table("fix_orders",
+                 [Column("settle_id", "str"), Column("amount", "int")],
+                 key_col="settle_id")
+    p.init_table("fix_details",
+                 [Column("settle_id", "str"), Column("qty", "int")],
+                 key_col="settle_id")
+    p.submit_business_batch(BusinessBatch("T1", [
+        TableBatchEntry("fix_orders", [
+            Record(1, {"settle_id": "S001", "amount": 100}, 1)], 1),
+        TableBatchEntry("fix_details", [
+            Record(1, {"settle_id": "S001", "qty": 2}, 1)], 1),
+    ]))
+
+    # 1) 发起先后裁决：同一笔结果的两条更正乱序送达（带 issued_seq）
+    p.submit_correction(CorrectionBatch("FIX-NEW", [
+        CorrectionItem("fix_orders", "S001", EventKind.UPSERT, 1,
+                       {"settle_id": "S001", "amount": 150}, issued_seq=100)]))
+    try:
+        # 更早发起（seq=90）、更晚送达的旧更正：不得翻掉 150
+        p.submit_correction(CorrectionBatch("FIX-OLD-LATE", [
+            CorrectionItem("fix_orders", "S001", EventKind.UPSERT, 1,
+                           {"settle_id": "S001", "amount": 110},
+                           issued_seq=90)]))
+    except BusinessBatchRejected as exc:
+        print("乱序旧更正被拒绝：",
+              [(f.reason.value, f.detail[:30]) for f in exc.failures])
+    print("乱序裁决后当前金额（保持更新结论 150）：",
+          p.current_state("fix_orders")["S001"]["amount"])
+
+    # 2) 业务键列改名 settle_id -> biz_id：改名后新数据可接入、老结果可更正
+    p.alter_schema("fix_orders", SchemaChange(
+        0, ChangeType.RENAME_COLUMN, "settle_id", to_name="biz_id"))
+    p.submit_correction(CorrectionBatch("FIX-AFTER-RENAME", [
+        CorrectionItem("fix_orders", "S001", EventKind.UPSERT, 2,
+                       {"biz_id": "S001", "amount": 160})]))
+    print("键列改名后更正老结果，当前金额：",
+          p.current_state("fix_orders")["S001"]["amount"])
+    try:
+        p.alter_schema("fix_orders", SchemaChange(
+            0, ChangeType.DROP_COLUMN, "biz_id"))
+    except Exception as exc:  # noqa: BLE001
+        print("删除业务键列被拒绝：", getattr(exc, "reason", type(exc).__name__))
+
+    # 3) 多表 DDL 战役：两张表一起加列，跨表更正整体落在同一结构快照
+    p.alter_schemas("DDL-1", [
+        ("fix_orders", SchemaChange(
+            0, ChangeType.ADD_COLUMN, "tag",
+            column=Column("tag", "str", required=False))),
+        ("fix_details", SchemaChange(
+            0, ChangeType.ADD_COLUMN, "tag",
+            column=Column("tag", "str", required=False))),
+    ])
+    p.submit_correction(CorrectionBatch("FIX-CROSS", [
+        CorrectionItem("fix_orders", "S001", EventKind.UPSERT, 3,
+                       {"biz_id": "S001", "amount": 170, "tag": "ok"}),
+        CorrectionItem("fix_details", "S001", EventKind.UPSERT, 2,
+                       {"settle_id": "S001", "qty": 3, "tag": "ok"}),
+    ]))
+    print("DDL 战役后跨表更正，两表 tag：",
+          p.current_state("fix_orders")["S001"].get("tag"),
+          p.current_state("fix_details")["S001"].get("tag"))
+
+
 if __name__ == "__main__":
     main()
     # 结算链路使用独立目录，避免覆盖上面的单表演示数据
@@ -152,3 +236,4 @@ if __name__ == "__main__":
     shutil.rmtree(demo_root, ignore_errors=True)
     sp = Pipeline(str(demo_root))
     settlement_demo(sp)
+    settlement_bugfix_demo(sp)

@@ -65,7 +65,7 @@ class SchemaEvolutionTest(IngestionCase):
         for i, (data, ver, reason) in enumerate(cases, start=1):
             # 每个原因一个全新 Pipeline 与表结构，避免批次留痕相互干扰
             sub = Pipeline(f"{self.root}/sub{i}")
-            sub.init_table("orders", self.cols)
+            sub.init_table("orders", self.cols, key_col="name")
             sub.alter_schema("orders", add_column("amount", "float",
                                                   True, 0.0))
             sub.alter_schema("orders", SchemaChange(

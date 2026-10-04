@@ -131,10 +131,16 @@ class CorrectionItem:
 
 @dataclass(frozen=True)
 class CorrectionBatch:
-    """一次更正/撤回请求；可只含一条，也可跨多表，整体生效。"""
+    """一次更正/撤回请求；可只含一条，也可跨多表，整体生效。
+
+    issued_at：上游发起该请求的逻辑时间戳（单调递增），用于乱序到达时判定
+    先后——最终结论按发起先后确定，更旧的请求不能翻掉更新的结论。
+    缺省 None 表示不携带发起时间，退化为按到达顺序（写序号）生效。
+    """
 
     correction_id: str
     items: list[CorrectionItem]
+    issued_at: int | None = None
 
 
 class TxState(str, Enum):

@@ -44,14 +44,36 @@ class SchemaStore:
         return any(e["table"] == table and e["change_type"] == _INIT
                    for e in self.changelog.read_all())
 
-    def key_col(self, table: str) -> str:
-        """该表的业务键列名（更正/撤回按此定位历史结果）；缺省为初始首列。"""
+    def _init_key_col(self, table: str) -> str:
+        """INIT 流水记录的原始业务键列名。"""
         for e in self.changelog.read_all():
             if e["table"] == table and e["change_type"] == _INIT:
                 if e.get("key_col"):
                     return e["key_col"]
                 return e["columns"][0]["name"]
         raise SchemaError(f"table={table} 尚未初始化")
+
+    def key_col_at(self, table: str, version: int) -> str:
+        """指定结构版本下业务键列的名字（改名链只回放到该版本）。
+
+        业务键是更正/撤回与当前状态的定位锚点：列改名不改变键的身份，
+        只是它在不同版本数据里的名字不同——v1 的行里叫旧名、改名后的行里叫新名。
+        """
+        name = self._init_key_col(table)
+        renames = sorted(
+            (e for e in self.changelog.read_all()
+             if e["table"] == table
+             and e["change_type"] == ChangeType.RENAME_COLUMN.value
+             and e["version"] <= version),
+            key=lambda e: e["version"])
+        for e in renames:
+            if e["column_name"] == name:
+                name = e["to_name"]
+        return name
+
+    def key_col(self, table: str) -> str:
+        """该表业务键列的当前名字（跟随改名链）；缺省为初始首列。"""
+        return self.key_col_at(table, self.current_version(table))
 
     def changes(self, table: str) -> list[SchemaChange]:
         out = []
@@ -127,45 +149,85 @@ class SchemaStore:
     def _next_version(self, table: str) -> int:
         return self.current_version(table) + 1
 
-    def add_column(self, table: str, column: Column) -> SchemaChange:
+    # ---- 校验（不落盘；多表原子变更先整体校验再整体应用） ----
+    def _validate_add(self, table: str, column: Column) -> None:
+        if any(c.name == column.name for c in self.columns(table)):
+            raise SchemaError(f"列 {column.name} 已存在")
+        if column.required and column.default is None:
+            raise SchemaError("新增必填列必须显式提供 default，缺省语义才可预期")
+
+    def _validate_drop(self, table: str, column_name: str) -> None:
+        if not any(c.name == column_name for c in self.columns(table)):
+            raise SchemaError(f"列 {column_name} 不存在，无法删除")
+        if column_name == self.key_col(table):
+            raise SchemaError(
+                f"列 {column_name} 是表 {table} 的业务键列：当前状态折叠与"
+                f"更正/撤回都靠它定位历史结果，删除后已接入数据将无法定位"
+                f"（接进来也查不到、想改也改不了），故不允许删除；"
+                f"如需调整请用 RENAME 改名（键身份会跟随改名链）或重建表")
+
+    def _validate_rename(self, table: str, old: str, new: str) -> None:
+        current = self.columns(table)
+        if not any(c.name == old for c in current):
+            raise SchemaError(f"列 {old} 不存在，无法改名")
+        if any(c.name == new for c in current):
+            raise SchemaError(f"列名 {new} 已被占用")
+
+    def validate_change(self, table: str, change: SchemaChange) -> None:
+        """只校验不落盘：供多表原子结构变更先做全量预检。"""
+        if change.change_type == ChangeType.ADD_COLUMN:
+            self._validate_add(table, change.column)
+        elif change.change_type == ChangeType.DROP_COLUMN:
+            self._validate_drop(table, change.column_name)
+        elif change.change_type == ChangeType.RENAME_COLUMN:
+            self._validate_rename(table, change.column_name, change.to_name)
+        else:
+            raise SchemaError(f"未知变更类型 {change.change_type}")
+
+    # ---- 变更 ----
+    def apply_change(self, table: str, change: SchemaChange) -> SchemaChange:
+        """应用一条已校验（或即将校验）的变更，版本严格 +1。"""
         with self.changelog.lock():
+            self.validate_change(table, change)
             version = self._next_version(table)
-            if any(c.name == column.name for c in self.columns(table)):
-                raise SchemaError(f"列 {column.name} 已存在")
-            if column.required and column.default is None:
-                raise SchemaError("新增必填列必须显式提供 default，缺省语义才可预期")
-            event = {
-                "table": table, "version": version,
-                "change_type": ChangeType.ADD_COLUMN.value,
-                "column_name": column.name, "to_name": None,
-                "column": _column_to_dict(column),
-            }
+            if change.change_type == ChangeType.ADD_COLUMN:
+                event = {
+                    "table": table, "version": version,
+                    "change_type": ChangeType.ADD_COLUMN.value,
+                    "column_name": change.column.name, "to_name": None,
+                    "column": _column_to_dict(change.column),
+                }
+                result = SchemaChange(version, ChangeType.ADD_COLUMN,
+                                      change.column.name, column=change.column)
+            elif change.change_type == ChangeType.DROP_COLUMN:
+                event = {
+                    "table": table, "version": version,
+                    "change_type": ChangeType.DROP_COLUMN.value,
+                    "column_name": change.column_name, "to_name": None,
+                    "column": None,
+                }
+                result = SchemaChange(version, ChangeType.DROP_COLUMN,
+                                      change.column_name)
+            else:
+                event = {
+                    "table": table, "version": version,
+                    "change_type": ChangeType.RENAME_COLUMN.value,
+                    "column_name": change.column_name,
+                    "to_name": change.to_name, "column": None,
+                }
+                result = SchemaChange(version, ChangeType.RENAME_COLUMN,
+                                      change.column_name, to_name=change.to_name)
             self._append(event)
-            return SchemaChange(version, ChangeType.ADD_COLUMN, column.name, column=column)
+            return result
+
+    def add_column(self, table: str, column: Column) -> SchemaChange:
+        return self.apply_change(table, SchemaChange(
+            0, ChangeType.ADD_COLUMN, column.name, column=column))
 
     def drop_column(self, table: str, column_name: str) -> SchemaChange:
-        with self.changelog.lock():
-            version = self._next_version(table)
-            if not any(c.name == column_name for c in self.columns(table)):
-                raise SchemaError(f"列 {column_name} 不存在，无法删除")
-            self._append({
-                "table": table, "version": version,
-                "change_type": ChangeType.DROP_COLUMN.value,
-                "column_name": column_name, "to_name": None, "column": None,
-            })
-            return SchemaChange(version, ChangeType.DROP_COLUMN, column_name)
+        return self.apply_change(table, SchemaChange(
+            0, ChangeType.DROP_COLUMN, column_name))
 
     def rename_column(self, table: str, old: str, new: str) -> SchemaChange:
-        with self.changelog.lock():
-            version = self._next_version(table)
-            current = self.columns(table)
-            if not any(c.name == old for c in current):
-                raise SchemaError(f"列 {old} 不存在，无法改名")
-            if any(c.name == new for c in current):
-                raise SchemaError(f"列名 {new} 已被占用")
-            self._append({
-                "table": table, "version": version,
-                "change_type": ChangeType.RENAME_COLUMN.value,
-                "column_name": old, "to_name": new, "column": None,
-            })
-            return SchemaChange(version, ChangeType.RENAME_COLUMN, old, to_name=new)
+        return self.apply_change(table, SchemaChange(
+            0, ChangeType.RENAME_COLUMN, old, to_name=new))

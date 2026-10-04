@@ -29,8 +29,10 @@ def main() -> None:
     source = LocalSource(JsonlStore(ROOT / "source.jsonl",
                                     lock=p._store_lock))
 
-    # 1) 建表
-    p.init_table("orders", [Column("id", "int"), Column("name", "str")])
+    # 1) 建表（业务键显式取 name：后续演示删除的是普通列 id，
+    #    业务键列是更正/撤回与当前状态的定位锚点，不允许删除）
+    p.init_table("orders", [Column("id", "int"), Column("name", "str")],
+                 key_col="name")
 
     # 2) 源端产生 3 条数据，其中第 2 条是坏数据
     source.produce("orders", {"id": 1, "name": "alice"}, 1)

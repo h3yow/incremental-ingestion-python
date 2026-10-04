@@ -34,7 +34,9 @@ class IngestionCase(unittest.TestCase):
             JsonlStore(f"{self.root}/source.jsonl",
                        lock=self.pipeline._store_lock))
         self.cols = [Column("id", "int"), Column("name", "str")]
-        self.pipeline.init_table("orders", self.cols)
+        # 业务键显式取 name：删列用例演示的是“删除普通列”，
+        # 业务键列是更正/撤回与当前状态的定位锚点，不允许删除
+        self.pipeline.init_table("orders", self.cols, key_col="name")
 
     def tearDown(self) -> None:
         self._tmp.cleanup()

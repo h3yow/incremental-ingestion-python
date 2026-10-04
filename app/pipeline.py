@@ -127,7 +127,8 @@ class Pipeline:
         self.target = TargetTable(rows_store)
         self.state = StateStore(
             rows_store,
-            KVStore(self.root / "seq.json", lock=self._store_lock))
+            KVStore(self.root / "seq.json", lock=self._store_lock),
+            key_col_at=self.schemas.key_col_at)
         self.tx_log = TxLog(
             JsonlStore(self.root / "transactions.jsonl", lock=self._store_lock))
         self._batch_store = JsonlStore(self.root / "batches.jsonl",
@@ -155,28 +156,36 @@ class Pipeline:
             return version
 
     def alter_schema(self, table: str, change: SchemaChange) -> SchemaChange:
-        """在 DDL 协调锁 + 表锁内串行执行结构变更。
+        """单表结构变更（多表原子变更的特例），见 alter_schemas。"""
+        return self.alter_schemas([(table, change)])[0]
 
-        协调锁保证：结构变更不会插入到一个跨表业务/更正事务的中间，
-        因而跨表事务的所有表分片按同一结构快照解释。
+    def alter_schemas(self, changes: list) -> list[SchemaChange]:
+        """多表原子结构变更：一批 (table, change) 要么全部生效、要么全部不生效。
+
+        在 DDL 协调锁 + 全部涉及表锁内先整体预检、再整体应用：
+        - 预检任一张表失败 -> 直接抛 SchemaError，任何表都不会落变更流水；
+        - 与跨表业务/更正事务互斥（同一把协调锁），因此跨表事务要么整体落在
+          这批变更之前、要么整体落在之后，不会一半表按旧结构、一半按新结构。
+        结算链路对多张关联表做配套结构变更时必须走这个接口；
+        逐张表单独 alter_schema 之间没有原子性保证。
         """
-        from app.models import ChangeType
+        from app.models import ChangeType  # noqa: F401 - 保留类型语义入口
+        tables = sorted({t for t, _ in changes})
         with self._ddl_lock:
-            lock = self._table_lock(table)
-            with lock:
-                if change.change_type == ChangeType.ADD_COLUMN:
-                    result = self.schemas.add_column(table, change.column)
-                elif change.change_type == ChangeType.DROP_COLUMN:
-                    result = self.schemas.drop_column(table, change.column_name)
-                elif change.change_type == ChangeType.RENAME_COLUMN:
-                    result = self.schemas.rename_column(
-                        table, change.column_name, change.to_name)
-                else:
-                    raise SchemaError(f"未知变更类型 {change.change_type}")
-                logger.info("[DDL] table=%s action=%s version=%s detail=%s->%s",
-                            table, result.change_type.value, result.version,
-                            result.column_name, result.to_name)
-                return result
+            with _MultiLock([self._table_lock(t) for t in tables]):
+                # 阶段一：全量预检（不落盘），任一失败则整批拒绝
+                for table, change in changes:
+                    self.schemas.validate_change(table, change)
+                # 阶段二：整体应用（每张表版本各自 +1）
+                results = []
+                for table, change in changes:
+                    result = self.schemas.apply_change(table, change)
+                    logger.info(
+                        "[DDL] table=%s action=%s version=%s detail=%s->%s",
+                        table, result.change_type.value, result.version,
+                        result.column_name, result.to_name)
+                    results.append(result)
+                return results
 
     # ---------------- 批次留痕 ----------------
     def _find_batch(self, table: str, batch_id: str) -> dict | None:
@@ -616,12 +625,14 @@ class Pipeline:
                     table, RejectReason.ENTRY_INVALID,
                     f"key={item.key!r} 更正必须携带完整数据", key=item.key))
                 return
-            # 业务键列必须与目标键一致且存在，防止更正落到错误的键上
-            if item.data.get(key_col) != item.key:
+            # 业务键列必须与目标键一致且存在，防止更正落到错误的键上；
+            # 键列可能被改名过：按更正数据自身声明的版本解析它当时的名字
+            key_name = self.schemas.key_col_at(table, item.schema_version)
+            if item.data.get(key_name) != item.key:
                 failures.append(EntryFailure(
                     table, RejectReason.ENTRY_INVALID,
-                    f"key={item.key!r} 与数据中的业务键列 {key_col!r}="
-                    f"{item.data.get(key_col)!r} 不一致", key=item.key))
+                    f"key={item.key!r} 与数据中的业务键列 {key_name!r}="
+                    f"{item.data.get(key_name)!r} 不一致", key=item.key))
                 return
             changes = self.schemas.changes(table)
             err, aligned = self.target.align_record(
@@ -653,14 +664,17 @@ class Pipeline:
         seq = self.state.allocate_write_seq(plan["table"])
         self.state.append_event(
             plan["table"], plan["key"], kind, plan["data"],
-            plan["schema_version"], seq, correction_id)
+            plan["schema_version"], seq, correction_id,
+            issued_at=plan.get("issued_at"))
 
     def submit_correction(self, correction: CorrectionBatch) -> BusinessBatchResult:
         """历史更正/撤回请求：按业务键覆盖或撤回，可跨表整体生效，幂等。
 
         - 幂等：相同 correction_id 重复提交直接回放首次结论（不再次应用、不翻转）；
         - 中断重放：PREPARED 已落盘时崩溃，重启自动前滚，(id,table,key) 去重；
-        - 整体生效：任一条预检失败则全部不生效，ABORTED 留痕精确定位。
+        - 整体生效：任一条预检失败则全部不生效，ABORTED 留痕精确定位；
+        - 乱序到达：携带 issued_at（上游发起逻辑时钟）时，最终结论按发起先后
+          确定——更旧的请求后送达只留痕、不翻掉已生效的更新结论。
         """
         if not correction.items:
             raise BusinessBatchRejected(correction.correction_id, [])
@@ -704,9 +718,10 @@ class Pipeline:
                             [(f.table, f.key, f.reason.value) for f in failures])
                 raise BusinessBatchRejected(correction.correction_id, failures)
 
-            # 在计划内注入 correction_id，供应用期去重
+            # 在计划内注入 correction_id / issued_at，供应用期去重与乱序判定
             for plan in plans:
                 plan["correction_id"] = correction.correction_id
+                plan["issued_at"] = correction.issued_at
             entries = [{"table": p["table"], "accepted_count": 1,
                         "checkpoint": 0, "rejected": [], "reason": None,
                         "detail": "", "key": p["key"]} for p in plans]

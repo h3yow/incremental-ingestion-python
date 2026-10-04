@@ -94,6 +94,22 @@ class CorrectionItemIn(BaseModel):
 class CorrectionIn(BaseModel):
     correction_id: str
     items: list[CorrectionItemIn]
+    # 上游发起该请求的逻辑时间戳：乱序到达时按发起先后定结论，缺省按到达顺序
+    issued_at: int | None = None
+
+
+class MultiSchemaChangeIn(BaseModel):
+    """多表原子结构变更：整批要么全部生效、要么全部不生效。"""
+
+    changes: list["TableSchemaChangeIn"]
+
+
+class TableSchemaChangeIn(BaseModel):
+    table: str
+    change_type: Literal["add_column", "drop_column", "rename_column"]
+    column_name: str
+    to_name: str | None = None
+    column: ColumnIn | None = None
 
 
 def _column(inp: ColumnIn) -> Column:
@@ -232,10 +248,33 @@ def create_app(pipeline: Pipeline | None = None,
                  for i in body.items]
         try:
             result = pipeline.submit_correction(
-                CorrectionBatch(body.correction_id, items))
+                CorrectionBatch(body.correction_id, items,
+                                issued_at=body.issued_at))
         except BusinessBatchRejected as exc:
             raise business_conflict(exc)
         return _business_result_json(result)
+
+    @app.post("/schema-changes")
+    def alter_schemas(body: MultiSchemaChangeIn):
+        """多表原子结构变更：整批预检通过后整体生效，任一失败则全部不生效。"""
+        changes = []
+        for c in body.changes:
+            changes.append((c.table, SchemaChange(
+                version=0,
+                change_type=ChangeType(c.change_type.upper()),
+                column_name=c.column_name,
+                to_name=c.to_name,
+                column=_column(c.column) if c.column else None,
+            )))
+        try:
+            results = pipeline.alter_schemas(changes)
+        except SchemaError as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc)})
+        return {"results": [
+            {"table": table, "schema_version": r.version,
+             "change_type": r.change_type.value,
+             "column_name": r.column_name, "to_name": r.to_name}
+            for (table, _), r in zip(changes, results)]}
 
     @app.get("/transactions/{txn_id}")
     def get_transaction(txn_id: str):

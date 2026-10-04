@@ -388,7 +388,7 @@ class ConcurrencyDeterminismTest(_SettlementCase):
         self.assertIn("tag", state[1])
 
     def test_correction_batch_interleaved_with_ddl_aligns_to_one_version(self):
-        """跨表更正与加列 DDL 并发：整批更正要么在 DDL 前、要么在其后，
+        """跨表更正与多表原子加列 DDL 并发：整批更正要么在 DDL 前、要么在其后，
         所有分片按同一个结构快照解释，不会落到不同字段集合。"""
         self.pipeline.submit_business_batch(BusinessBatch("set-1", [
             TableBatchEntry("orders", [
@@ -417,11 +417,11 @@ class ConcurrencyDeterminismTest(_SettlementCase):
         def do_ddl():
             barrier.wait()
             try:
-                # 两张表同时加可空列
-                self.pipeline.alter_schema(
-                    "orders", add_column("tag", "str", required=False))
-                self.pipeline.alter_schema(
-                    "details", add_column("tag", "str", required=False))
+                # 结算链路对两张表做配套变更：多表原子 DDL（整批生效或整批不生效）
+                self.pipeline.alter_schemas([
+                    ("orders", add_column("tag", "str", required=False)),
+                    ("details", add_column("tag", "str", required=False)),
+                ])
             except Exception as exc:  # noqa: BLE001
                 errors.append(("ddl", exc))
 

@@ -121,7 +121,28 @@ uv run fastapi dev main.py            # HTTP 服务（http://127.0.0.1:8000/docs
   DDL 协调锁（锁序恒为 协调锁 → 表锁，与单表 DDL 相同），因此结构变更不会
   插入到跨表事务的中间——整批的所有表分片按**同一个结构快照**校验与对齐，
   不会出现「前几张表按旧字段、后几张表按新字段」。
-- **兼容范围**：加列（含必填列带稳定缺省）、改名、删列对历史版本数据仍然可对齐；
+- **多表原子结构变更**：`Pipeline.alter_schemas([(table, change), ...])`
+  （HTTP：`POST /schema-changes`）把一批涉及多张表的变更合成**一个原子步骤**：
+  先对全部表预检（不落盘），任一失败则整批拒绝、任何表都不变；全部通过才
+  整体应用（每张表版本各自 +1）。结算链路对订单/明细等关联表做配套变更时
+  **必须**走这个接口——这样跨表更正/业务批次与整批结构变更被同一把协调锁
+  串行，同一批更正**要么整体落在变更前的结构上、要么整体落在变更后的结构上**；
+  若仍逐张表单独 `alter_schema`，两次变更之间存在窗口，跨表事务可能落在
+  「A 表已变、B 表未变」的中间快照上（逐表语义各自正确，但不构成配套变更的
+  整体结论）。
+- **业务键列的结构变更**（业务键列是更正/撤回与当前状态的定位锚点）：
+  - **改名（RENAME）允许**：键的身份跟随改名链，`key_col` 始终返回当前名字；
+    当前状态折叠与历史查询按**每一行自身的结构版本**解析键列名字
+    （改名前的行里是旧名、之后的行里是新名），因此改名后已接入数据依然
+    查得到，按新名（新结构版本）或旧名（旧结构版本）发起的更正/撤回都能
+    正确定位历史结果。
+  - **删除（DROP）拒绝**：删除业务键列会让已接入数据失去定位锚点
+    （接进来也查不到、想改也改不了），DDL 阶段直接报错拒绝
+    （错误信息指明该列是业务键列、可改名或重建表），结构版本不变、无副作用；
+    键列改名后的新名字同样受保护。删除普通列不受影响（历史行不改写，
+    新行按新结构对齐、不再携带被删列）。
+- **兼容范围**：加列（含必填列带稳定缺省）、改名（含业务键列改名）、
+  删除普通列对历史版本数据仍然可对齐；
   更正数据同样走版本对齐（按更正声明的 `schema_version` 校验、对齐到当前结构）。
   不支持列类型变更与删除业务键列（业务键是更正/撤回的定位锚点）。
 
@@ -166,20 +187,35 @@ uv run fastapi dev main.py            # HTTP 服务（http://127.0.0.1:8000/docs
 - **撤回后的语义**：撤回表示该业务结果在当前状态中不再有效；撤回后不能再对该键
   直接更正（`KEY_NOT_FOUND`）——上游需作为新业务结果重新接入，杜绝「撤回后又
   冒出来」。
+- **乱序到达的先后判定（issued_at）**：同一笔结果的多条更正/撤回可能乱序送达
+  （后送达的那条反而更早发起、内容更旧）。`CorrectionBatch` 可携带
+  `issued_at`（上游发起该请求的**逻辑时间戳**，单调递增）：
+  - 最终结论按**发起先后**确定：每个业务键生效的是 `issued_at` 最大的事件
+    （相同则按写序号），更早发起的请求即使后送达，也只写入留痕（可审计），
+    **不会**把已生效的更新结论翻回旧值；
+  - 推论：若更新发起的撤回已生效，更早发起的更正后送达时会因当前无有效结论
+    被 `KEY_NOT_FOUND` 拒绝——两种到达顺序下最终状态一致；
+  - 不携带 `issued_at` 的请求保持**按到达顺序**生效（与引入该语义前一致），
+    视为发起时间最旧；同一业务键的更正建议统一携带 `issued_at`；
+  - `key_history` 返回每个事件的 `issued_at`，结论如何胜出可完整解释。
 - **幂等与中断重放**：
   - 相同 `correction_id` 重复提交 → 直接回放首次结论（成功回放结果、失败回放 409），
     不再写事件、不再取号，结论不翻转；
   - 事件按 `(correction_id, table, key)` 去重，PREPARED 后崩溃、重启前滚或
-    调用方重放，最终状态完全一致。
+    调用方重放，最终状态完全一致（`issued_at` 随 PREPARED 文档落盘，
+    恢复后排序结论不变）。
 
 ## 4C. 并发下的确定顺序
 
 更正、正常增量提交、结构变更可能同时发生，结论必须可线性化：
 
-- **同表操作**由表锁串行：对同一键的并发更正按取号顺序依次生效，当前值恒等于
-  最后获胜者；历史 `seq` 严格单调、无空洞，旧值不会与新值来回翻转。
-- **跨表操作**整体排在 DDL 的前或后（见 4A 的协调锁），不存在「跨表只生效一半」
-  或「同一批更正落到不同字段集合」。
+- **同表操作**由表锁串行：对同一键的并发更正按取号顺序依次生效；携带
+  `issued_at` 时最终结论按发起先后确定（见 4B），旧值不会与新值来回翻转；
+  历史 `seq` 严格单调、无空洞。
+- **跨表操作**整体排在 DDL 的前或后（见 4A 的协调锁）；对多张关联表的配套
+  结构变更须用多表原子变更接口（`alter_schemas` / `POST /schema-changes`），
+  保证同一批更正要么整体落在变更前、要么整体落在变更后，重启恢复后落到
+  同一个结果（PREPARED 文档自包含，恢复按原快照应用，不受后续 DDL 影响）。
 - **重启恢复**从上次确认的边界继续：位点只升不降、PREPARED 事务幂等前滚，
   恢复后继续处理新提交仍收敛到同一最终状态。
 
@@ -188,7 +224,8 @@ uv run fastapi dev main.py            # HTTP 服务（http://127.0.0.1:8000/docs
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/business-batches` | 跨表业务批次整体提交（两阶段，幂等键 `business_batch_id`） |
-| POST | `/corrections` | 历史更正/撤回批次（可跨表，幂等键 `correction_id`） |
+| POST | `/corrections` | 历史更正/撤回批次（可跨表，幂等键 `correction_id`，可带 `issued_at` 判定乱序先后） |
+| POST | `/schema-changes` | 多表原子结构变更（整批预检、整体生效或整体不生效） |
 | GET  | `/transactions/{id}` | 业务事务留痕（PREPARED/COMMITTED/ABORTED、逐表结论） |
 | GET  | `/tables/{table}/state` | 当前状态：业务键 → 最后一次有效数据（不含已撤回） |
 | GET  | `/tables/{table}/state/history?key=..` | 某业务键的全部增量写入与更正/撤回历史 |
@@ -226,11 +263,20 @@ curl -s -XPOST localhost:8000/business-batches -H 'content-type: application/jso
        {"table":"details","schema_version":1,
         "records":[{"offset":1,"data":{"line_id":"L1","settle_id":"S001","qty":2}}]}]}'
 
-# 对历史结果 S001 发起更正（当前状态覆盖，历史留痕保留）
+# 对历史结果 S001 发起更正（当前状态覆盖，历史留痕保留；
+#   issued_at 为上游发起逻辑时钟，乱序到达时按发起先后定结论）
 curl -s -XPOST localhost:8000/corrections -H 'content-type: application/json' \
-  -d '{"correction_id":"FIX-S001-1","items":[
+  -d '{"correction_id":"FIX-S001-1","issued_at":7,"items":[
        {"table":"orders","key":"S001","op":"UPSERT","schema_version":1,
         "data":{"settle_id":"S001","amount":120}}]}'
+
+# 多表原子结构变更（订单表与明细表配套加列，整批生效或整批不生效）
+curl -s -XPOST localhost:8000/schema-changes -H 'content-type: application/json' \
+  -d '{"changes":[
+       {"table":"orders","change_type":"add_column","column_name":"tag",
+        "column":{"name":"tag","typ":"str","required":false}},
+       {"table":"details","change_type":"add_column","column_name":"tag",
+        "column":{"name":"tag","typ":"str","required":false}}]}'
 
 curl -s localhost:8000/tables/orders/state
 curl -s 'localhost:8000/tables/orders/state/history?key=S001'
@@ -239,7 +285,7 @@ curl -s localhost:8000/transactions/S001
 
 ## 6. 验证方法（测试覆盖）
 
-`uv run python -m unittest discover -s tests -v`，共 30 个用例：
+`uv run python -m unittest discover -s tests -v`，共 45 个用例：
 
 - `test_batch_and_offset.py`（现有，不回归）
   - 重复提交幂等、不重复写入；
@@ -253,7 +299,7 @@ curl -s localhost:8000/transactions/S001
   - `UNKNOWN_COLUMN / TYPE_MISMATCH / MISSING_REQUIRED` 可区分；
   - 超前结构版本整批拒绝；
   - 200 条数据的并发批次与加列 DDL 同时发生，最终行数、位点、顺序严格一致。
-- `test_business_and_correction.py`（新增，14 个）
+- `test_business_and_correction.py`（现有，不回归）
   - 跨表业务批次整体成功；中途某表失败时**所有表都不生效**，409 精确指出
     业务批次/表/offset/原因，`ABORTED` 留痕可查；
   - 业务批次成功与失败结论的重复提交均回放首次结果、不重复写入；
@@ -264,20 +310,36 @@ curl -s localhost:8000/transactions/S001
   - 跨表更正中一条失败则整批不生效；撤回携带数据等非法请求 `ENTRY_INVALID`；
   - 20 路并发更正同一键：写序号全序、当前值等于最后获胜者；
   - 更正 / 单表增量 / 加列 DDL 并发：可线性化，状态与结构版本自洽；
-  - **跨表更正批次与两表加列 DDL 并发：整批更正落到同一结构快照**
+  - 跨表更正批次与**多表原子加列 DDL** 并发：整批更正落到同一结构快照
     （两表新增字段有无一致），不会一半旧字段一半新字段；
   - 单表增量与更正/跨表批次写同一业务键时共享一条写序号全序，折叠顺序
     等于真实提交顺序，不会旧值回翻。
+- `test_settlement_robustness.py`（新增，15 个；日志按 `[SCENARIO] 业务/用例/结果`
+  打印覆盖情况）
+  - **业务一·业务键列结构变更**：键列改名后新数据接得进、查得到，历史不丢；
+    改名后按新名/旧名发起的更正与撤回都能定位历史结果；跨表业务批次在键列
+    改名后仍整体提交且可见；删除业务键列（含改名后的新名）DDL 阶段拒绝、
+    原因可读、无副作用；删除普通列不受影响（历史行不改写、新行按新结构对齐）。
+  - **业务二·跨表更正 vs 多表结构变更**：多表原子 DDL 与跨表更正并发 50 轮，
+    每轮两表结构快照一致（同批更正要么整体在变更前、要么整体在变更后），
+    重启恢复后结论不变；多表原子 DDL 任一表预检失败则整批不生效；
+    更正 PREPARED 落盘后结构才变更的，重启恢复仍按原快照应用到同一结果。
+  - **业务三·更正/撤回乱序与重放**：更旧发起的更正/撤回后送达不翻掉更新结论
+    （留痕可审计）；更新发起的撤回生效后，更旧的更正后送达被 `KEY_NOT_FOUND`
+    拒绝、两种到达顺序最终状态一致；重复提交回放首次结论、崩溃中断后重启
+    前滚、再乱序送达旧请求，最终状态都与首次完全一致；不带 `issued_at` 的
+    旧式请求保持按到达顺序生效。
 - `test_api.py`（5 个）：HTTP 维度验证单表幂等回放、409 原因区分、
   结构变更后的拉取对齐，以及跨表失败 409 定位、更正/撤回/当前状态/历史接口。
 
 端到端演示：`uv run python demo.py`，先演示单表接入，再在
 `data_demo/settlement/` 下演示结算链路的跨表整体提交、失败定位、历史更正与撤回。
 
-本地验证建议：
+本地复现与验证建议：
 
 ```bash
-uv run python -m unittest discover -s tests -v          # 全量单测
+uv run python -m unittest discover -s tests -v          # 全量单测（45 个）
+uv run python -m unittest tests.test_settlement_robustness -v   # 只跑本次修复的三类场景
 uv run python demo.py                                   # 端到端演示
 uv run fastapi dev main.py                              # HTTP 服务，/docs 可交互
 ```
